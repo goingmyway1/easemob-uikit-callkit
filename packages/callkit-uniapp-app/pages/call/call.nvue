@@ -1,0 +1,293 @@
+<template>
+	<view class="page">
+		<!--
+			通话页只吃数据、不碰实例。
+			nvue 页面与 vue 页面处于两个 JS 上下文，`getCallKit()` 在这里永远是 null，
+			所以状态由宿主通过 uni.$emit('em-callkit:view') 推送，动作原路回传。
+		-->
+		<view v-if="view.visible" class="stage-wrap" :style="stageStyle">
+			<em-call-stage :view="view" :theme="theme" @accept="onAccept" @refuse="onRefuse" @hangup="onHangup"
+				@audio-changed="onAudioChanged" @video-changed="onVideoChanged" @media-command-failed="onMediaCommandFailed"
+				@rtc-report="onRtcReport" @error="onError" />
+		</view>
+
+		<!-- 兜底：直接进来 / 宿主没推快照时不再白屏 -->
+		<view v-else class="fallback">
+			<text class="fallback-title">{{ failure ? '通话页无法打开' : '正在准备通话…' }}</text>
+			<text v-if="failure" class="fallback-tip">{{ failure }}</text>
+			<view v-if="failure" class="fallback-btn" @click="goBack">
+				<text class="fallback-btn-text">返回</text>
+			</view>
+		</view>
+	</view>
+</template>
+
+<script>
+// 与 src/ui/callStageHost.ts 的常量保持一致（nvue 不支持 TS，无法 import 那份源码）
+import EmCallStage from '@/uni_modules/em-callkit-app/components/em-call-stage/em-call-stage.nvue'
+
+const VIEW_EVENT = 'em-callkit:view'
+const ACTION_EVENT = 'em-callkit:action'
+
+function emptyView() {
+	return {
+		visible: false,
+		callId: '',
+		appId: '',
+		channelName: '',
+		token: '',
+		uid: 0,
+		mediaType: 'audio',
+		callDirection: 'outgoing',
+		ringing: false,
+		shouldJoin: false,
+		groupMode: false,
+		groupId: '',
+		groupName: '',
+		remoteName: '',
+		remoteAvatar: '',
+		groupParticipants: [],
+		groupRtcProfiles: {},
+		groupWaiting: false,
+		initialAudioMuted: false,
+		initialVideoMuted: false,
+		audioMuted: false,
+		videoMuted: false,
+		audioCommandId: 0,
+		videoCommandId: 0
+	}
+}
+
+export default {
+	components: { EmCallStage },
+	data() {
+		return {
+			view: emptyView(),
+			failure: '',
+			// agora-rtc 插件内部不处理状态栏，需要宿主让出这一段，否则顶部状态文字会被压
+			safeTop: 0,
+			pageCallId: '',
+			closing: false,
+			ending: false,
+			closedReported: false,
+			readyTimer: null,
+			theme: {
+				backgroundColor: '#0b0b0f',
+				textColor: '#ffffff',
+				mutedTextColor: 'rgba(255, 255, 255, 0.72)',
+				accentColor: '#4d7cfe',
+				dangerColor: '#ff3b30',
+				placeholderBackgroundColor: '#1b1e25'
+			}
+		}
+	},
+	computed: {
+		stageStyle() {
+			return { paddingTop: this.safeTop + 'px' }
+		}
+	},
+	watch: {
+		'view.visible'(next) {
+			if (!next) this.finish()
+		}
+	},
+	onLoad() {
+		// 通话页是深色背景：状态栏用白字，否则深色底上的黑字看不见
+		// #ifdef APP-PLUS
+		plus.navigator.setStatusBarStyle('light')
+		// #endif
+		try {
+			const info = uni.getSystemInfoSync()
+			this.safeTop = Number(info && info.statusBarHeight) || 0
+		} catch (error) {
+			this.safeTop = 0
+		}
+
+		uni.$on(VIEW_EVENT, this.handleView)
+		// 页面可能晚于事件创建，主动要一次快照
+		this.sendAction('ready')
+
+		// 3 秒还没收到快照，说明宿主没挂中继（attachCallStageHost）
+		this.readyTimer = setTimeout(() => {
+			if (!this.view.visible && !this.failure) {
+				this.failure = '宿主未推送通话数据，请确认已调用 attachCallStageHost 并完成登录'
+			}
+		}, 3000)
+	},
+	onBackPress() {
+		if (!this.view.visible) return false
+		// The host decides refusal versus hangup for this page's call only.
+		this.endCall('back')
+		return true
+	},
+	onUnload() {
+		this.clearReadyTimer()
+		uni.$off(VIEW_EVENT, this.handleView)
+		// Unexpected unload still terminates the owned call; finish reports only once.
+		this.closing = true
+		this.reportClosed()
+		// #ifdef APP-PLUS
+		plus.navigator.setStatusBarStyle('dark')
+		// #endif
+	},
+	methods: {
+		handleView(next) {
+			if (this.closing || !next || typeof next !== 'object') return
+			if (this.pageCallId) {
+				if (next.callId && next.callId !== this.pageCallId) return
+				if (next.visible && next.callId !== this.pageCallId) return
+			} else if (next.visible) {
+				if (typeof next.callId !== 'string' || !next.callId) return
+				this.pageCallId = next.callId
+			}
+			this.view = next
+			if (next.visible) {
+				this.failure = ''
+				this.clearReadyTimer()
+			} else if (this.pageCallId) {
+				// Close synchronously: a following call snapshot must not retag this page.
+				this.finish()
+			}
+		},
+		sendAction(type, payload = {}) {
+			if (type === 'ready') {
+				if (!this.closing) uni.$emit(ACTION_EVENT, { type })
+				return
+			}
+			if (!this.pageCallId || (payload.callId && payload.callId !== this.pageCallId)) return
+			if (type !== 'closed' && (this.closing || this.ending)) return
+			if (type === 'refuse' || type === 'hangup' || type === 'back') this.ending = true
+			uni.$emit(ACTION_EVENT, { ...payload, type, callId: this.pageCallId })
+		},
+		endCall(type, payload = {}) {
+			if (this.closing || this.ending || !this.pageCallId || (payload.callId && payload.callId !== this.pageCallId)) return
+			this.sendAction(type, payload)
+		},
+		reportClosed() {
+			if (this.closedReported) return
+			this.closedReported = true
+			this.sendAction('closed')
+		},
+		clearReadyTimer() {
+			if (this.readyTimer) {
+				clearTimeout(this.readyTimer)
+				this.readyTimer = null
+			}
+		},
+		onAccept(payload) {
+			this.sendAction('accept', payload)
+		},
+		onRefuse(payload) {
+			this.endCall('refuse', payload)
+		},
+		onHangup(payload) {
+			this.endCall('hangup', payload)
+		},
+		onAudioChanged(payload) {
+			const commandId = Number(payload && payload.commandId) || 0
+			// 必须经 sendAction 附带 callId：宿主会丢弃未标记的跨上下文动作，
+			// 否则旧页面的迟到回执会改到下一通电话。
+			this.sendAction('audio-muted', {
+				muted: Boolean(payload && payload.muted),
+				...(commandId > 0 ? { commandId } : {})
+			})
+		},
+		onVideoChanged(payload) {
+			const commandId = Number(payload && payload.commandId) || 0
+			this.sendAction('video-muted', {
+				muted: Boolean(payload && payload.muted),
+				...(commandId > 0 ? { commandId } : {})
+			})
+		},
+		onMediaCommandFailed(payload) {
+			if (!payload || (payload.kind !== 'audio' && payload.kind !== 'video')) return
+			this.sendAction('media-command-failed', {
+				kind: payload.kind,
+				commandId: Number(payload.commandId) || 0,
+				error: String(payload.error || '原生媒体命令失败')
+			})
+		},
+		onRtcReport(report) {
+			if (report && typeof report.type === 'string') {
+				this.sendAction('rtc-event', { report })
+			}
+		},
+		onError(error) {
+			console.error('[demo] 通话页错误', error)
+		},
+		finish() {
+			if (this.closing) return
+			this.closing = true
+			this.clearReadyTimer()
+			// 走带 callId 的统一出口；onUnload 的 reportClosed 会因 closedReported 去重。
+			this.reportClosed()
+			uni.navigateBack()
+		},
+		goBack() {
+			this.finish()
+		}
+	}
+}
+</script>
+
+<style>
+/*
+ * nvue 里 view 默认就是 flex column，但父级必须是 flex 容器，
+ * 子级的 flex: 1 才会撑满整屏，否则插件 UI 会塌到屏幕上方一小块。
+ */
+.page {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	background-color: #0b0b0f;
+}
+
+.stage-wrap {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+}
+
+.fallback {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	padding-left: 32px;
+	padding-right: 32px;
+}
+
+.fallback-title {
+	font-size: 17px;
+	color: #ffffff;
+	text-align: center;
+}
+
+.fallback-tip {
+	margin-top: 10px;
+	font-size: 13px;
+	color: rgba(255, 255, 255, 0.6);
+	line-height: 20px;
+	text-align: center;
+}
+
+.fallback-btn {
+	margin-top: 26px;
+	height: 46px;
+	padding-left: 36px;
+	padding-right: 36px;
+	border-radius: 23px;
+	background-color: #4d7cfe;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.fallback-btn-text {
+	font-size: 15px;
+	color: #ffffff;
+	line-height: 20px;
+	text-align: center;
+}
+</style>

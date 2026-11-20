@@ -1,0 +1,1057 @@
+<template>
+	<view class="group-call" :style="rootStyle">
+		<!-- 顶部栏：右侧为人数角标；收起、邀请等业务动作请用 header 插槽接入 -->
+		<view v-if="showHeader" class="top-bar" :style="headerContainerStyle">
+			<slot name="header" :title="title || defaultTitle" :state="callState">
+				<text v-if="title" class="top-title" :style="mutedTextStyle">{{ title }}</text>
+				<view v-if="joined" class="member-badge">
+					<text class="member-badge-text">{{ memberCount }}</text>
+				</view>
+			</slot>
+		</view>
+
+		<!-- 状态提示只在入房、等待、重连和错误时出现 -->
+		<view v-if="showStatus" class="group-status">
+			<slot v-if="isPermissionError" name="permission-denied" :error="lastError" :state="callState">
+				<text class="group-error" :style="errorTextStyle">{{ statusText }}</text>
+			</slot>
+			<slot v-else-if="lastError" name="error" :error="lastError" :state="callState">
+				<text class="group-error" :style="errorTextStyle">{{ statusText }}</text>
+			</slot>
+			<slot v-else-if="joining" name="loading" :state="callState">
+				<text class="group-status-text" :style="statusTextStyle">{{ statusText }}</text>
+			</slot>
+			<slot v-else-if="joined && remoteUids.length === 0" name="empty" :state="callState">
+				<text class="group-status-text" :style="statusTextStyle">等待其他成员加入</text>
+			</slot>
+			<slot v-else name="status" :state="callState" :status-text="statusText">
+				<text class="group-status-text" :style="statusTextStyle">{{ statusText }}</text>
+			</slot>
+			<text v-if="hiddenRemoteCount > 0" class="group-hidden" :style="mutedTextStyle">另有
+				{{ hiddenRemoteCount }} 人未显示</text>
+			<view v-if="canJoin && (!autoJoin || lastError)" class="group-join" :style="accentStyle" @click="startJoin">
+				<text class="group-control-text" :style="textStyle">{{ lastError ? '重试' : '加入通话' }}</text></view>
+		</view>
+
+		<scroll-view class="grid-scroll" scroll-y>
+			<view class="stage">
+				<!-- 所有成员复用同一批原生视图：展开/收回只改布局，不重建视图、不重绑 UID，避免安卓黑屏 -->
+				<view class="remote-grid" :style="gridStyle">
+					<!-- 展开主窗口占位，让底部网格从主窗口下方开始 -->
+					<view v-if="expanded" class="featured-spacer" :style="featuredSpacerStyle"></view>
+
+					<view class="remote-card" :style="tileStyle(0)" @click="handleGridTap(0)">
+						<agora-video-view v-if="isVideo && joined" ref="localGridVideo" :uid="0"
+							renderMode="hidden" renderType="texture" :style="tileVideoStyle(0)"
+							@bind-error="reportVideoBindError" />
+						<!-- 原生视频会消费触摸事件，透明层保证点击能冒泡到卡片 -->
+						<view class="tap-layer" :style="tileVideoStyle(0)"></view>
+						<view v-if="!isVideo || !joined || videoMuted" class="card-placeholder"
+							:style="[tileVideoStyle(0), placeholderStyle]">
+							<slot name="local-placeholder" :uid="localUid" :muted="videoMuted">
+								<view class="card-avatar" :style="accentStyle"><text class="card-avatar-text">我</text></view>
+								<text class="placeholder-label" :style="mutedTextStyle">{{ isVideo && videoMuted ? '摄像头已关闭' : '本地音频' }}</text>
+							</slot>
+						</view>
+						<text class="card-label" :style="cardLabelStyle">我</text>
+						<slot name="local-overlay" :uid="localUid" :audio-muted="audioMuted" :video-muted="videoMuted" />
+					</view>
+
+					<view v-for="remoteUid in displayRemoteUids" :key="remoteUid" class="remote-card"
+						:style="tileStyle(remoteUid)" @click="handleGridTap(remoteUid)">
+						<agora-video-view v-if="isVideo" :ref="'remoteVideo' + remoteUid" :uid="remoteUid"
+							renderMode="hidden" renderType="texture" :style="tileVideoStyle(remoteUid)"
+							@bind-error="reportVideoBindError" />
+						<view class="tap-layer" :style="tileVideoStyle(remoteUid)"></view>
+						<view v-if="!isVideo || remoteVideoOffUids.indexOf(remoteUid) !== -1" class="card-placeholder"
+							:style="[tileVideoStyle(remoteUid), placeholderStyle]">
+							<slot name="remote-placeholder" :uid="remoteUid" :video-off="true">
+								<!-- [callkit-patch] 远端头像/首字母：由 remoteProfiles 提供，缺失时回退首字母 -->
+								<view class="card-avatar" :style="accentStyle">
+									<image v-if="remoteAvatarURL(remoteUid)" class="card-avatar-image"
+										:src="remoteAvatarURL(remoteUid)" mode="aspectFill"
+										@error="markRemoteAvatarFailed(remoteUid)" />
+									<text v-else class="card-avatar-text">{{ remoteInitial(remoteUid) }}</text>
+								</view>
+								<text class="placeholder-label" :style="mutedTextStyle">{{ isVideo ? '摄像头已关闭' : '远端音频' }}</text>
+							</slot>
+						</view>
+						<view v-if="isRemoteAudioMuted(remoteUid)" class="card-mute">
+							<agora-call-icon name="microphone-off" :size="14" />
+						</view>
+						<!-- [callkit-patch] 网格标签用昵称，缺失时回退裸 UID -->
+						<text class="card-label" :style="cardLabelStyle">{{ remoteDisplayName(remoteUid) }}</text>
+						<slot name="remote-overlay" :uid="remoteUid" :audio-muted="isRemoteAudioMuted(remoteUid)"
+							:video-off="remoteVideoOffUids.indexOf(remoteUid) !== -1" />
+					</view>
+
+					<!-- [callkit-patch] 已邀请但尚未进入 RTC 的成员：只占位，不创建视频视图 -->
+					<view v-for="participant in pendingParticipants" :key="'pending-' + participant.userId"
+						class="remote-card pending-card" :style="cardStyle">
+						<view class="card-placeholder pending-placeholder" :style="[videoStyle, placeholderStyle]">
+							<view class="pending-avatar" :style="accentStyle">
+								<image v-if="pendingAvatarURL(participant)" class="pending-avatar-image"
+									:src="pendingAvatarURL(participant)" mode="aspectFill"
+									@error="markPendingAvatarFailed(participant.userId)" />
+								<text v-else class="pending-avatar-text">{{ pendingInitial(participant) }}</text>
+							</view>
+							<text class="placeholder-label" :style="mutedTextStyle">{{ pendingHint(participant) }}</text>
+						</view>
+						<text class="card-label" :style="cardLabelStyle">{{ participant.nickname || participant.userId }}</text>
+					</view>
+				</view>
+			</view>
+		</scroll-view>
+
+		<!-- 控制栏：与一对一视频保持同一套图标 + 名称 + 状态网格 -->
+		<view class="group-controls" :style="controlsStyle">
+			<slot v-if="showControls" name="controls" :audio-muted="audioMuted" :video-muted="videoMuted"
+				:speaker-enabled="speakerphoneEnabled" :joined="joined">
+				<!-- 视频：第一行 麦克风 / 摄像头 / 扬声器；语音只在操作行展示麦克风与扬声器 -->
+				<view v-if="isVideo" class="control-row">
+					<view class="control-item" :style="controlItemStyle">
+						<view class="control-button" :style="audioMuted ? controlOffStyle : controlStyle" @click="toggleAudio">
+							<slot name="audio-icon" :muted="audioMuted"><agora-call-icon
+									:name="audioMuted ? 'microphone-off' : 'microphone'" :size="26" /></slot>
+						</view>
+						<text class="control-label" :style="textStyle">麦克风</text>
+						<text class="control-state" :style="mutedTextStyle">{{ audioMuted ? '已关闭' : '已开启' }}</text>
+					</view>
+					<view class="control-item" :style="controlItemStyle">
+						<view class="control-button" :style="videoMuted ? controlOffStyle : controlStyle" @click="toggleVideo">
+							<slot name="video-icon" :muted="videoMuted"><agora-call-icon
+									:name="videoMuted ? 'video-off' : 'video'" :size="26" /></slot>
+						</view>
+						<text class="control-label" :style="textStyle">摄像头</text>
+						<text class="control-state" :style="mutedTextStyle">{{ videoMuted ? '已关闭' : '已开启' }}</text>
+					</view>
+					<view class="control-item" :style="controlItemStyle">
+						<view class="control-button" :style="speakerphoneEnabled ? controlStyle : controlOffStyle" @click="toggleSpeaker">
+							<slot name="speaker-icon" :enabled="speakerphoneEnabled"><agora-call-icon
+									:name="speakerphoneEnabled ? 'speaker' : 'earpiece'" :size="26" /></slot>
+						</view>
+						<text class="control-label" :style="textStyle">扬声器</text>
+						<text class="control-state" :style="mutedTextStyle">{{ speakerphoneEnabled ? '已开启' : '已关闭' }}</text>
+					</view>
+				</view>
+				<!-- 操作行：挂断居中；视频右侧为翻转摄像头，语音左右为麦克风/扬声器 -->
+				<view class="action-row">
+					<view v-if="isVideo" class="control-item" :style="controlItemStyle"></view>
+					<view v-else class="control-item" :style="controlItemStyle">
+						<view class="control-button" :style="audioMuted ? controlOffStyle : controlStyle" @click="toggleAudio">
+							<slot name="audio-icon" :muted="audioMuted"><agora-call-icon
+									:name="audioMuted ? 'microphone-off' : 'microphone'" :size="26" /></slot>
+						</view>
+						<text class="control-label" :style="textStyle">麦克风</text>
+						<text class="control-state" :style="mutedTextStyle">{{ audioMuted ? '已关闭' : '已开启' }}</text>
+					</view>
+
+					<view class="control-item" :style="controlItemStyle">
+						<view class="hangup-button" :style="dangerStyle" @click="endCall">
+							<slot name="hangup-icon"><agora-call-icon name="hangup" :size="34" /></slot>
+						</view>
+						<text class="hangup-label" :style="textStyle">挂断</text>
+					</view>
+
+					<view v-if="isVideo" class="control-item" :style="controlItemStyle">
+						<view class="control-button" :style="controlStyle" @click="flipCamera">
+							<slot name="camera-icon"><agora-call-icon name="camera-switch" :size="26" /></slot>
+						</view>
+						<text class="control-label" :style="textStyle">翻转摄像头</text>
+					</view>
+					<view v-else class="control-item" :style="controlItemStyle">
+						<view class="control-button" :style="speakerphoneEnabled ? controlStyle : controlOffStyle" @click="toggleSpeaker">
+							<slot name="speaker-icon" :enabled="speakerphoneEnabled"><agora-call-icon
+									:name="speakerphoneEnabled ? 'speaker' : 'earpiece'" :size="26" /></slot>
+						</view>
+						<text class="control-label" :style="textStyle">扬声器</text>
+						<text class="control-state" :style="mutedTextStyle">{{ speakerphoneEnabled ? '已开启' : '已关闭' }}</text>
+					</view>
+				</view>
+			</slot>
+			<slot name="control-extra" />
+		</view>
+		<slot name="footer" />
+	</view>
+</template>
+
+<script>
+	import callComponent from '../../mixins/call-component.js'
+	import AgoraCallIcon from '../agora-call-icon/agora-call-icon.nvue'
+	import {
+		RTC_CONNECTION_STATE,
+		REMOTE_MEDIA_STATE
+	} from '../../index.js'
+
+	// 原生 ref 可能晚于 $nextTick 就绪；按帧有限次重试，避免恢复摄像头后停在黑屏。
+	const VIDEO_BIND_RETRY_DELAY_MS = 80
+	const VIDEO_BIND_MAX_ATTEMPTS = 6
+
+	// 舞台与卡片间距，需与样式中的 padding / margin 保持一致。
+	const STAGE_PADDING = 12
+	const CARD_GAP = 8
+
+	/**
+	 * 一对多默认皮肤：默认所有成员都在网格中（两个人一行两个，超过两个一行三个）。
+	 * 点击网格视频展开到顶部主窗口，其余成员在底部一行三个；点击底部卡片与主窗口切换，
+	 * 点击主窗口收回网格。remoteUids 保存加入顺序，v-for 以 UID 为稳定 key；
+	 * maxRemoteUsers 只限制展示，不改变自动订阅配置，也不代表 SDK 的最大房间人数。
+	 */
+	export default {
+		name: 'AgoraCallGroup',
+		components: { AgoraCallIcon },
+		mixins: [callComponent],
+		props: {
+			columns: {
+				type: Number,
+				default: 3
+			},
+			maxRemoteUsers: {
+				type: Number,
+				default: 0
+			},
+			/** 网格卡片宽高比（宽 / 高），也用于展开主窗口的等比放大，默认 3:4。 */
+			cardAspectRatio: {
+				type: Number,
+				default: 3 / 4
+			},
+			/** [callkit-patch] 已邀请但尚未入房的成员；只渲染占位卡片，不绑定 RTC 视频。 */
+			pendingParticipants: {
+				type: Array,
+				default: () => []
+			},
+			/** [callkit-patch] RTC 数字 UID → 用户昵称/头像；用于替换网格里的裸 UID。 */
+			remoteProfiles: {
+				type: Object,
+				default: () => ({})
+			}
+		},
+		watch: {
+			maxRemoteUsers() {
+				if (this.expandedUid !== null && this.displayRemoteUids.indexOf(this.expandedUid) === -1) {
+					this.expandedUid = null
+				}
+				this.bindVideoWindows()
+			}
+		},
+		created() {
+			// ref 名 → { view, uid, ready }；原生实例不能放进 data，也不能被响应式代理。
+			this.videoBindings = {}
+			this.videoBindRetryTimer = null
+		},
+		mounted() {
+			// 控制栏真实高度参与主窗口最大高度计算；测量失败时用估算值兜底。
+			this.$nextTick(() => this.measureControlsHeight())
+		},
+		data() {
+			return {
+				remoteUids: [],
+				remoteVideoOffUids: [],
+				remoteAudioMutedUids: [],
+				// 展开到顶部主窗口的 UID；null 表示全部成员都在网格中（默认）。
+				expandedUid: null,
+				// 各成员视频流尺寸（已按 rotation 归一），主窗口宽度占满、高度按流比例计算。
+				videoSizes: {},
+				// 控制栏实测高度，用于限制主窗口最大高度。
+				controlsHeight: 0,
+				// [callkit-patch] 加载失败的头像回退到首字母，避免留下空蓝圈
+				remoteAvatarFailed: {},
+				pendingAvatarFailed: {}
+			}
+		},
+		computed: {
+			defaultTitle() {
+				return this.isVideo ? '多人音视频通话' : '多人语音通话'
+			},
+			headerHeight() {
+				return this.safeAreaTop + 52
+			},
+			headerContainerStyle() {
+				return {
+					...this.headerStyle,
+					paddingTop: this.safeAreaTop + 'px',
+					height: this.headerHeight + 'px'
+				}
+			},
+			memberCount() {
+				return this.remoteUids.length + 1
+			},
+			showStatus() {
+				if (this.isPermissionError || this.lastError) return true
+				if (this.joining || this.reconnecting) return true
+				if (this.joined && this.remoteUids.length === 0) return true
+				if (this.hiddenRemoteCount > 0) return true
+				return this.canJoin && (!this.autoJoin || Boolean(this.lastError))
+			},
+			normalizedColumns() {
+				return Math.max(1, Math.min(4, Math.round(Number(this.columns) || 3)))
+			},
+			normalizedAspectRatio() {
+				return Number(this.cardAspectRatio) > 0 ? Number(this.cardAspectRatio) : 3 / 4
+			},
+			participantCount() {
+				// [callkit-patch] 待入房成员也占一个格子，网格列数按总数计算
+				return this.displayRemoteUids.length + this.pendingParticipants.length + 1
+			},
+			expanded() {
+				return this.expandedUid !== null
+			},
+			/** 网格列数：两个人一行两个，超过两个（以及展开时的底部网格）一行三个。 */
+			gridColumns() {
+				const max = Math.min(3, this.normalizedColumns)
+				if (this.expanded) return max
+				return this.participantCount <= 2 ? Math.min(2, max) : max
+			},
+			/** 展开后底部剩余的成员数。 */
+			remainingCount() {
+				return Math.max(0, this.participantCount - (this.expanded ? 1 : 0))
+			},
+			gridStyle() {
+				return {
+					justifyContent: this.remainingCount > 0 && this.remainingCount < this.gridColumns ?
+						'center' : 'flex-start'
+				}
+			},
+			featuredWidth() {
+				return this.windowWidth - STAGE_PADDING * 2
+			},
+			/** 控制栏高度；首帧未测量到时用与样式一致的估算值。 */
+			estimatedControlsHeight() {
+				const actionRow = 76 + 8 + 16 + 20
+				const videoRow = this.isVideo ? (64 + 8 + 16 + 2 + 14 + 10) : 0
+				return this.safeAreaBottom + 18 + actionRow + videoRow
+			},
+			cardWidth() {
+				const columns = this.gridColumns
+				const available = this.windowWidth - STAGE_PADDING * 2 - columns * CARD_GAP
+				return Math.floor(available / columns)
+			},
+			cardHeight() {
+				return Math.max(64, Math.floor(this.cardWidth / this.normalizedAspectRatio))
+			},
+			/** 主窗口先按卡片比例等比放大，再限制在头部、控制栏和底部一行网格之外的空间内。 */
+			availableMainHeight() {
+				const controls = this.controlsHeight > 0 ? this.controlsHeight : this.estimatedControlsHeight
+				const reserved = this.headerHeight + controls + this.cardHeight + CARD_GAP + STAGE_PADDING + 4
+				return Math.max(140, this.windowHeight - reserved)
+			},
+			/** 展开成员的实际视频尺寸（已按旋转归一）；拿不到尺寸时返回 null。 */
+			expandedVideoSize() {
+				if (this.expandedUid === null) return null
+				return this.videoSizes[String(this.expandedUid)] || null
+			},
+			/** 主窗口优先跟随视频流比例，拿不到尺寸时回退到卡片比例。 */
+			expandedAspectRatio() {
+				const size = this.expandedVideoSize
+				if (size && size.width > 0 && size.height > 0) return size.width / size.height
+				return this.normalizedAspectRatio
+			},
+			featuredHeight() {
+				const desired = Math.round(this.featuredWidth / this.expandedAspectRatio)
+				return Math.max(140, Math.min(desired, this.availableMainHeight))
+			},
+			featuredCardStyle() {
+				return {
+					width: this.featuredWidth + 'px',
+					height: this.featuredHeight + 'px',
+					backgroundColor: this.theme.cardBackgroundColor || '#1b1e25'
+				}
+			},
+			featuredVideoStyle() {
+				return {
+					width: this.featuredWidth + 'px',
+					height: this.featuredHeight + 'px'
+				}
+			},
+			/** 展开主窗口的占位高度，让底部网格从主窗口下方开始。 */
+			featuredSpacerStyle() {
+				return {
+					width: this.featuredWidth + 'px',
+					height: this.featuredHeight + 'px',
+					marginBottom: CARD_GAP + 'px'
+				}
+			},
+			cardStyle() {
+				return {
+					width: this.cardWidth + 'px',
+					height: this.cardHeight + 'px',
+					backgroundColor: this.theme.cardBackgroundColor || '#1b1e25'
+				}
+			},
+			videoStyle() {
+				return {
+					width: this.cardWidth + 'px',
+					height: this.cardHeight + 'px'
+				}
+			},
+			cardLabelStyle() {
+				return {
+					color: this.theme.textColor || '#ffffff'
+				}
+			},
+			controlItemWidth() {
+				return Math.floor((this.windowWidth - 32) / 3)
+			},
+			controlItemStyle() {
+				return {
+					width: this.controlItemWidth + 'px'
+				}
+			},
+			controlsStyle() {
+				return {
+					paddingBottom: (this.safeAreaBottom + 18) + 'px'
+				}
+			},
+			displayRemoteUids() {
+				const limit = Math.max(0, Math.floor(Number(this.maxRemoteUsers) || 0))
+				return limit > 0 ? this.remoteUids.slice(0, limit) : this.remoteUids
+			},
+			hiddenRemoteCount() {
+				return Math.max(0, this.remoteUids.length - this.displayRemoteUids.length)
+			}
+		},
+		methods: {
+			getVideoRef(ref) {
+				const value = this.$refs[ref]
+				return Array.isArray(value) ? value[0] : value
+			},
+			ensureVideoBindings() {
+				if (!this.videoBindings) this.videoBindings = {}
+				return this.videoBindings
+			},
+			clearVideoBindRetry() {
+				if (!this.videoBindRetryTimer) return
+				clearTimeout(this.videoBindRetryTimer)
+				this.videoBindRetryTimer = null
+			},
+			/** 当前应当存在的“ref → UID”映射；主窗口 + 本地网格 + 其余远端网格。 */
+			/** 所有已展示成员始终共用同一批视图；展开/收回只改布局，不重绑 UID。 */
+			desiredVideoWindows() {
+				if (!this.isVideo || !this.joined) return []
+				if (!this.session || !this.session.engineReady) return []
+				const windows = [{
+					ref: 'localGridVideo',
+					uid: 0
+				}]
+				this.displayRemoteUids.forEach((uid) => {
+					windows.push({
+						ref: 'remoteVideo' + uid,
+						uid: Number(uid)
+					})
+				})
+				return windows
+			},
+			/** 用记录的实例解绑：ref 已指向新实例时，旧 Canvas 仍需要被清理。 */
+			unbindVideoWindow(ref) {
+				const bindings = this.ensureVideoBindings()
+				const binding = bindings[ref]
+				delete bindings[ref]
+				if (!binding || !binding.view || typeof binding.view.unbindVideo !== 'function') return
+				const returnValue = binding.view.unbindVideo()
+				const result = returnValue === null || returnValue === undefined ? null : Number(returnValue)
+				this.logVideoViewApi('unbindVideo', ref, binding.uid, result)
+			},
+			bindVideoWindow(item) {
+				const view = item.view
+				if (!view || typeof view.bindVideo !== 'function') return
+				const returnValue = view.bindVideo(Number(item.uid))
+				const result = returnValue === null || returnValue === undefined ? null : Number(returnValue)
+				this.logVideoViewApi('bindVideo', item.ref, item.uid, result)
+				this.ensureVideoBindings()[item.ref] = {
+					view,
+					uid: Number(item.uid),
+					ready: view.viewReady === true
+				}
+			},
+			/**
+			 * 统一绑定主窗口与网格窗口。
+			 *
+			 * 1. 先统一解绑所有需要变更或不再需要的窗口，再统一绑定，避免同一 UID 的
+			 *    Canvas 被旧窗口的解绑清掉（主窗口/网格交换时必须遵守这个顺序）；
+			 * 2. 原生视图常驻，关闭摄像头或远端 STOPPED 时只叠加占位层，不卸载视图；
+			 * 3. ref 或原生布局晚于 $nextTick 就绪时按帧有限次重试。
+			 *
+			 * options.force：重连、回前台、恢复本地预览后需要强制重绑。
+			 * options.refs：只处理指定窗口，避免无关画面闪烁。
+			 */
+			bindVideoWindows(options) {
+				const force = Boolean(options && options.force)
+				const attempt = Math.max(0, Number(options && options.attempt) || 0)
+				const scope = options && Array.isArray(options.refs) ? options.refs : null
+				const inScope = (ref) => !scope || scope.indexOf(ref) !== -1
+				this.clearVideoBindRetry()
+				if (this.disposed || !this.isVideo) return
+				if (!this.session || !this.session.engineReady) return
+				this.$nextTick(() => {
+					if (this.disposed || !this.isVideo || !this.session.engineReady) return
+					const bindings = this.ensureVideoBindings()
+					const desired = this.desiredVideoWindows()
+					const desiredRefs = {}
+					desired.forEach((item) => {
+						desiredRefs[item.ref] = item
+					})
+					const toBind = []
+					let pending = false
+
+					// 第一阶段：解绑不再需要、实例变化、UID 变化或强制重绑的窗口。
+					Object.keys(bindings).forEach((ref) => {
+						if (!inScope(ref)) return
+						const target = desiredRefs[ref]
+						if (!target) {
+							this.unbindVideoWindow(ref)
+							return
+						}
+						const view = this.getVideoRef(ref)
+						if (!view) {
+							pending = true
+							return
+						}
+						const binding = bindings[ref]
+						if (force || binding.view !== view || binding.uid !== target.uid) {
+							this.unbindVideoWindow(ref)
+							toBind.push({
+								ref,
+								uid: target.uid,
+								view
+							})
+							return
+						}
+						// viewReady=false 表示原生只排队未绑定，等组件在 NVLayouted 重放后确认。
+						if (binding.ready !== true) {
+							if (view.viewReady === true) binding.ready = true
+							else pending = true
+						}
+					})
+
+					// 第二阶段：补上尚未记录的窗口，再统一绑定。
+					desired.forEach((item) => {
+						if (!inScope(item.ref)) return
+						if (bindings[item.ref]) return
+						if (toBind.some((bind) => bind.ref === item.ref)) return
+						const view = this.getVideoRef(item.ref)
+						if (!view) {
+							pending = true
+							return
+						}
+						toBind.push({
+							ref: item.ref,
+							uid: item.uid,
+							view
+						})
+					})
+					toBind.forEach((item) => this.bindVideoWindow(item))
+
+					if (pending && attempt < VIDEO_BIND_MAX_ATTEMPTS) {
+						this.videoBindRetryTimer = setTimeout(() => {
+							this.videoBindRetryTimer = null
+							this.bindVideoWindows({
+								force,
+								refs: scope,
+								attempt: attempt + 1
+							})
+						}, VIDEO_BIND_RETRY_DELAY_MS)
+					}
+				})
+			},
+			/** 离开、连接失败和销毁前统一清理主窗口与所有网格 Canvas。 */
+			unbindAllVideos() {
+				this.clearVideoBindRetry()
+				Object.keys(this.ensureVideoBindings()).forEach((ref) => this.unbindVideoWindow(ref))
+			},
+			isRemoteAudioMuted(uid) {
+				return this.remoteAudioMutedUids.indexOf(Number(uid)) !== -1
+			},
+			// [callkit-patch] 远端资料与待入房占位展示：不改 RTC 逻辑，只影响卡片文案/头像
+			remoteProfile(uid) {
+				return this.remoteProfiles[String(uid)] || null
+			},
+			remoteDisplayName(uid) {
+				const profile = this.remoteProfile(uid)
+				return profile && (profile.nickname || profile.userId) ? (profile.nickname || profile.userId) : String(uid)
+			},
+			remoteInitial(uid) {
+				const name = String(this.remoteDisplayName(uid) || '')
+				return name ? name.slice(0, 1) : '?'
+			},
+			remoteAvatarURL(uid) {
+				const key = String(uid)
+				if (this.remoteAvatarFailed[key]) return ''
+				const profile = this.remoteProfile(uid)
+				return profile && profile.avatarURL ? profile.avatarURL : ''
+			},
+			markRemoteAvatarFailed(uid) {
+				if (this.remoteAvatarFailed[String(uid)]) return
+				const failed = {}
+				Object.keys(this.remoteAvatarFailed).forEach((key) => {
+					failed[key] = this.remoteAvatarFailed[key]
+				})
+				failed[String(uid)] = true
+				this.remoteAvatarFailed = failed
+			},
+			pendingAvatarURL(participant) {
+				if (!participant || !participant.avatarURL) return ''
+				if (this.pendingAvatarFailed[participant.userId]) return ''
+				return participant.avatarURL
+			},
+			markPendingAvatarFailed(userId) {
+				if (!userId || this.pendingAvatarFailed[userId]) return
+				const failed = {}
+				Object.keys(this.pendingAvatarFailed).forEach((key) => {
+					failed[key] = this.pendingAvatarFailed[key]
+				})
+				failed[userId] = true
+				this.pendingAvatarFailed = failed
+			},
+			pendingInitial(participant) {
+				const name = String((participant && (participant.nickname || participant.userId)) || '')
+				return name ? name.slice(0, 1) : '?'
+			},
+			pendingHint(participant) {
+				return participant && participant.state === 'accepted' ? '正在加入' : '等待接听'
+			},
+			isExpandedUid(uid) {
+				return this.expandedUid !== null && Number(this.expandedUid) === Number(uid)
+			},
+			/** 展开的卡片绝对定位到顶部并放大，其余卡片继续按网格排列。 */
+			tileStyle(uid) {
+				if (this.isExpandedUid(uid)) {
+					return {
+						...this.featuredCardStyle,
+						position: 'absolute',
+						left: '0px',
+						top: '0px',
+						zIndex: 2,
+						marginRight: '0px',
+						marginBottom: '0px',
+						borderRadius: '14px'
+					}
+				}
+				return this.cardStyle
+			},
+			tileVideoStyle(uid) {
+				return this.isExpandedUid(uid) ? this.featuredVideoStyle : this.videoStyle
+			},
+			/** 点击卡片：未展开时展开；点击已展开的主窗口收回；点击其他卡片与主窗口切换。 */
+			handleGridTap(uid) {
+				const target = Number(uid)
+				if (target !== 0 && !this.remoteUids.includes(target)) return
+				if (this.isExpandedUid(target)) {
+					this.collapseMain()
+					return
+				}
+				this.expandedUid = target
+				if (target !== 0) {
+					this.$emit('remote-user-click', {
+						uid: target
+					})
+				}
+				// 不重建视图、不重绑 UID：只改布局，避免安卓重建 Canvas 后黑屏。
+			},
+			/** 点击主窗口：收回网格，恢复“两个一行两个 / 超过两个一行三个”的排列。 */
+			collapseMain() {
+				if (!this.expanded) return
+				this.expandedUid = null
+			},
+			/** 测量控制栏高度，避免展开的主窗口把底部网格顶出可视区域。 */
+			measureControlsHeight() {
+				if (typeof uni === 'undefined' || typeof uni.createSelectorQuery !== 'function') return
+				uni.createSelectorQuery().in(this).select('.group-controls').boundingClientRect((rect) => {
+					const height = rect && Number(rect.height)
+					if (height > 0) this.controlsHeight = Math.round(height)
+				}).exec()
+			},
+			onCallJoined() {
+				this.bindVideoWindows()
+				this.$nextTick(() => this.measureControlsHeight())
+			},
+			onCallLeft() {
+				this.unbindAllVideos()
+				this.remoteUids = []
+				this.remoteVideoOffUids = []
+				this.remoteAudioMutedUids = []
+				// [callkit-patch] 重置时清空头像失败缓存，避免下次同 UID 头像被永久跳过
+				this.remoteAvatarFailed = {}
+				this.pendingAvatarFailed = {}
+				this.videoSizes = {}
+				this.expandedUid = null
+			},
+			onRemoteUserJoined(data) {
+				const uid = Number(data.uid)
+				if (!this.remoteUids.includes(uid)) this.remoteUids.push(uid)
+				this.remoteVideoOffUids = this.remoteVideoOffUids.filter((item) => item !== uid)
+				this.remoteAudioMutedUids = this.remoteAudioMutedUids.filter((item) => item !== uid)
+				// 展开的远端被 maxRemoteUsers 挤出展示列表时收回网格。
+				if (this.expandedUid !== null && this.expandedUid !== 0 &&
+					!this.displayRemoteUids.includes(this.expandedUid)) {
+					this.expandedUid = null
+				}
+				this.bindVideoWindows()
+			},
+			onRemoteUserOffline(data) {
+				const uid = Number(data.uid)
+				if (this.expandedUid === uid) this.expandedUid = null
+				if (this.videoSizes[String(uid)]) {
+					const nextSizes = {}
+					Object.keys(this.videoSizes).forEach((item) => {
+						if (item !== String(uid)) nextSizes[item] = this.videoSizes[item]
+					})
+					this.videoSizes = nextSizes
+				}
+				this.remoteUids = this.remoteUids.filter((item) => item !== uid)
+				this.remoteVideoOffUids = this.remoteVideoOffUids.filter((item) => item !== uid)
+				this.remoteAudioMutedUids = this.remoteAudioMutedUids.filter((item) => item !== uid)
+				// 解绑已离席成员的窗口，并把被限制展示的成员补进网格。
+				this.bindVideoWindows()
+			},
+			/** STOPPED 时只用占位层覆盖最后一帧，不卸载原生视图，避免恢复时重新绑定失败。 */
+			onRemoteVideoState(data) {
+				const uid = Number(data.uid)
+				if (!this.remoteUids.includes(uid)) return
+				const state = Number(data.state)
+				if (state === REMOTE_MEDIA_STATE.STOPPED) {
+					if (!this.remoteVideoOffUids.includes(uid)) this.remoteVideoOffUids.push(uid)
+				}
+				if (state === REMOTE_MEDIA_STATE.STARTING || state === REMOTE_MEDIA_STATE.DECODING) {
+					this.remoteVideoOffUids = this.remoteVideoOffUids.filter((item) => item !== uid)
+					this.bindVideoWindows()
+				}
+			},
+			/** 网格中展示每个远端成员的麦克风状态。 */
+			onRemoteAudioState(data) {
+				const uid = Number(data.uid)
+				if (!this.remoteUids.includes(uid)) return
+				const state = Number(data.state)
+				const muted = state === REMOTE_MEDIA_STATE.STOPPED
+				const listed = this.remoteAudioMutedUids.indexOf(uid) !== -1
+				if (muted && !listed) this.remoteAudioMutedUids.push(uid)
+				if (!muted) this.remoteAudioMutedUids = this.remoteAudioMutedUids.filter((item) => item !== uid)
+			},
+			/** 记录各成员视频流尺寸，主窗口宽度占满、高度按流比例计算。 */
+			onVideoSizeChanged(data) {
+				const uid = Number(data.uid)
+				const width = Number(data.width)
+				const height = Number(data.height)
+				if (!(width > 0) || !(height > 0)) return
+				const rotation = Number(data.rotation) || 0
+				const displayWidth = rotation % 180 === 0 ? width : height
+				const displayHeight = rotation % 180 === 0 ? height : width
+				const key = String(uid)
+				const current = this.videoSizes[key]
+				if (current && current.width === displayWidth && current.height === displayHeight) return
+				const next = {}
+				Object.keys(this.videoSizes).forEach((item) => {
+					next[item] = this.videoSizes[item]
+				})
+				next[key] = {
+					width: displayWidth,
+					height: displayHeight
+				}
+				this.videoSizes = next
+			},
+			onConnectionFailure() {
+				// 连接失败时先解绑，避免原生视图停留并显示最后一帧。
+				this.unbindAllVideos()
+			},
+			onConnectionStateChanged(data) {
+				if (Number(data.state) === RTC_CONNECTION_STATE.CONNECTED && this.joined) {
+					this.bindVideoWindows({
+						force: true
+					})
+				}
+			},
+			onPreviewResumed() {
+				this.bindVideoWindows({
+					force: true
+				})
+			},
+			/**
+			 * 关闭摄像头时不卸载原生视图、也不解绑 Canvas：占位层会覆盖冻结帧，
+			 * 恢复采集后强制重绑本地窗口（可能在主窗口，也可能在网格）。
+			 */
+			onLocalVideoChanged(muted) {
+				if (muted) return
+				// 本地视频始终在同一个网格视图里，展开/收回只改布局。
+				this.bindVideoWindows({
+					force: true,
+					refs: ['localGridVideo']
+				})
+			},
+			beforeCallDispose() {
+				this.unbindAllVideos()
+			},
+			toggleAudio() {
+				this.setAudioMuted(!this.audioMuted).catch((error) => this.reportError(error))
+			},
+			toggleVideo() {
+				this.setVideoMuted(!this.videoMuted).catch((error) => this.reportError(error))
+			},
+			flipCamera() {
+				this.switchCamera().catch((error) => this.reportError(error))
+			},
+			toggleSpeaker() {
+				this.setSpeakerphoneEnabled(!this.speakerphoneEnabled).catch((error) => this.reportError(error))
+			},
+			startJoin() {
+				this.join().catch(() => {})
+			},
+			endCall() {
+				this.hangUp().catch((error) => this.reportError(error))
+			}
+		}
+	}
+</script>
+
+<style>
+	.group-call {
+		flex: 1;
+		position: relative;
+	}
+
+	.top-bar {
+		padding-left: 16px;
+		padding-right: 16px;
+		flex-direction: row;
+		align-items: center;
+		/* 默认内容只有右侧人数角标，标题用绝对定位居中；header 插槽可整体替换。 */
+		justify-content: flex-end;
+	}
+
+	.top-title {
+		position: absolute;
+		left: 80px;
+		right: 80px;
+		text-align: center;
+		font-size: 15px;
+	}
+
+	.member-badge {
+		height: 20px;
+		padding-left: 10px;
+		padding-right: 10px;
+		border-radius: 10px;
+		background-color: rgba(20, 22, 28, 0.92);
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.55);
+		align-items: center;
+		justify-content: center;
+	}
+
+	.member-badge-text {
+		color: #ffffff;
+		font-size: 11px;
+	}
+
+	.group-status {
+		padding: 2px 16px 6px;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.group-status-text {
+		font-size: 13px;
+	}
+
+	.group-hidden {
+		margin-top: 2px;
+		font-size: 12px;
+	}
+
+	.group-error {
+		font-size: 13px;
+		text-align: center;
+	}
+
+	.grid-scroll {
+		flex: 1;
+	}
+
+	.stage {
+		padding: 0px 12px 12px;
+	}
+
+	.remote-grid {
+		flex-direction: row;
+		flex-wrap: wrap;
+	}
+
+	/* 覆盖在原生视频之上的透明层，保证点击能冒泡到卡片（收回 / 切换）。 */
+	.tap-layer {
+		position: absolute;
+		left: 0;
+		top: 0;
+		background-color: transparent;
+		z-index: 1;
+	}
+
+	.remote-card {
+		position: relative;
+		margin-right: 8px;
+		margin-bottom: 8px;
+		border-radius: 12px;
+		overflow: hidden;
+	}
+
+	.card-placeholder {
+		position: absolute;
+		left: 0;
+		top: 0;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.card-avatar {
+		width: 54px;
+		height: 54px;
+		border-radius: 27px;
+		color: #ffffff;
+		font-size: 18px;
+		text-align: center;
+		line-height: 54px;
+		align-items: center;
+		justify-content: center;
+		overflow: hidden;
+	}
+
+	/* [callkit-patch] 头像图与首字母、待入房占位卡片样式 */
+	.card-avatar-text {
+		color: #ffffff;
+		font-size: 18px;
+		line-height: 54px;
+		text-align: center;
+	}
+
+	.card-avatar-image {
+		width: 54px;
+		height: 54px;
+		border-radius: 27px;
+	}
+
+	.pending-card {
+		background-color: rgba(27, 30, 37, 0.92);
+	}
+
+	.pending-placeholder {
+		align-items: center;
+		justify-content: center;
+	}
+
+	.pending-avatar {
+		width: 54px;
+		height: 54px;
+		border-radius: 27px;
+		align-items: center;
+		justify-content: center;
+		overflow: hidden;
+	}
+
+	.pending-avatar-image {
+		width: 54px;
+		height: 54px;
+		border-radius: 27px;
+	}
+
+	.pending-avatar-text {
+		color: #ffffff;
+		font-size: 18px;
+		line-height: 54px;
+		text-align: center;
+	}
+
+	.placeholder-label {
+		margin-top: 10px;
+		font-size: 12px;
+	}
+
+	.card-label {
+		position: absolute;
+		left: 10px;
+		bottom: 10px;
+		font-size: 12px;
+		padding: 4px 10px;
+		border-radius: 12px;
+		background-color: rgba(0, 0, 0, 0.45);
+	}
+
+	.card-mute {
+		position: absolute;
+		right: 8px;
+		top: 8px;
+		width: 24px;
+		height: 24px;
+		border-radius: 12px;
+		background-color: rgba(0, 0, 0, 0.45);
+		align-items: center;
+		justify-content: center;
+	}
+
+	.group-controls {
+		padding-left: 16px;
+		padding-right: 16px;
+	}
+
+	.control-row {
+		flex-direction: row;
+		align-items: flex-start;
+		justify-content: flex-start;
+		margin-top: 10px;
+	}
+
+	.control-item {
+		align-items: center;
+	}
+
+	.control-button {
+		width: 64px;
+		height: 64px;
+		border-radius: 32px;
+		align-items: center;
+		justify-content: center;
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.22);
+	}
+
+	.control-label {
+		margin-top: 8px;
+		font-size: 12px;
+		text-align: center;
+	}
+
+	.control-state {
+		margin-top: 2px;
+		font-size: 11px;
+		text-align: center;
+	}
+
+	.group-control-text {
+		font-size: 14px;
+	}
+
+	.action-row {
+		margin-top: 20px;
+		flex-direction: row;
+		align-items: center;
+		justify-content: flex-start;
+	}
+
+	.hangup-button {
+		width: 76px;
+		height: 76px;
+		border-radius: 38px;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.hangup-label {
+		margin-top: 8px;
+		font-size: 12px;
+	}
+
+	.group-join {
+		margin-top: 8px;
+		width: 160px;
+		height: 44px;
+		border-radius: 22px;
+		align-items: center;
+		justify-content: center;
+	}
+</style>

@@ -1,0 +1,9 @@
+{
+  "deploymentTarget": "13.0",
+  "dependencies-pods": [
+    {
+      "name": "AgoraRtcEngine_iOS/RtcBasic",
+      "version": "4.5.2"
+    }
+  ]
+}

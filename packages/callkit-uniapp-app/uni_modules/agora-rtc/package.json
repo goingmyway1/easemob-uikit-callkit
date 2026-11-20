@@ -1,0 +1,17 @@
+{
+  "id": "agora-rtc",
+  "displayName": "Agora RTC 4.x",
+  "version": "1.0.0",
+  "description": "声网 RTC 4.x UTS 桥接，支持 Android/iOS 单频道音视频通话",
+  "license": "UNLICENSED",
+  "types": "index.d.ts",
+  "keywords": ["agora", "rtc", "uts", "音视频"],
+  "repository": "",
+  "engines": {
+    "HBuilderX": "^4.0.0"
+  },
+  "uni_modules": {
+    "dependencies": [],
+    "externals": []
+  }
+}

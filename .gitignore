@@ -26,6 +26,7 @@ lib/style.css.d.ts
 .vscode/*
 !.vscode/extensions.json
 .idea
+.hbuilderx/
 .DS_Store
 *.suo
 *.ntvs*
@@ -36,4 +37,6 @@ lib/style.css.d.ts
 # AI/IDE generated knowledge bases
 .qoder/
 .trae/documents/
+.workbuddy/
+.workbuddy-ai/
 *.tsbuildinfo

@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./*"]
+    },
+    "types": ["@dcloudio/types"]
+  },
+  "include": ["**/*.ts", "**/*.js", "**/*.vue", "**/*.nvue"],
+  "exclude": ["node_modules", "unpackage", "dist"]
+}

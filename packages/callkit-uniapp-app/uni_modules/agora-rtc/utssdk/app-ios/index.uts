@@ -1,0 +1,283 @@
+import {
+  AgoraRtcEngineKit,
+  AgoraRtcEngineDelegate,
+  AgoraRtcEngineConfig,
+  AgoraRtcChannelMediaOptions,
+  AgoraRtcVideoCanvas,
+  AgoraChannelStats,
+  AgoraChannelProfile,
+  AgoraClientRole,
+  AgoraVideoRenderMode,
+  AgoraErrorCode,
+  AgoraConnectionState,
+  AgoraConnectionChangedReason,
+  AgoraVideoRemoteState,
+  AgoraVideoRemoteReason,
+  AgoraAudioRemoteState,
+  AgoraAudioRemoteReason,
+  AgoraUserOfflineReason,
+  AgoraVideoSourceType,
+  AgoraVideoEncoderConfiguration,
+  AgoraVideoFrameRate,
+  AgoraVideoOutputOrientationMode,
+  AgoraVideoMirrorMode,
+  AgoraVideoBitrateStandard
+} from 'AgoraRtcKit'
+import { NSObject } from 'Foundation'
+import { CGSize } from 'CoreGraphics'
+import { UIView } from 'UIKit'
+import { AVCaptureDevice, AVMediaType } from 'AVFoundation'
+import { JoinChannelOptions, PermissionOptions, RtcEventCallback } from '../interface'
+
+const INVALID_ARGUMENT = -2
+const ENGINE_NOT_CREATED = -1001
+const ENGINE_APP_ID_CHANGED = -1002
+
+let rtcEngine : AgoraRtcEngineKit | null = null
+let currentAppId = ''
+let eventCallback : RtcEventCallback | null = null
+
+function emit(event : string, data : UTSJSONObject = {} as UTSJSONObject) {
+  eventCallback?.(event, data)
+}
+
+class AgoraRtcEventHandler extends NSObject implements AgoraRtcEngineDelegate {
+  constructor() {
+    super()
+  }
+
+  rtcEngine(engine : AgoraRtcEngineKit, @argumentLabel("didJoinChannel") channel : string, @argumentLabel("withUid") uid : UInt, @argumentLabel("elapsed") elapsed : Int) {
+    emit('joinChannelSuccess', { channel, uid, elapsed } as UTSJSONObject)
+  }
+
+  rtcEngine(engine : AgoraRtcEngineKit, @argumentLabel("didLeaveChannelWith") stats : AgoraChannelStats) {
+    emit('leaveChannel', { duration: stats.duration } as UTSJSONObject)
+  }
+
+  rtcEngine(engine : AgoraRtcEngineKit, @argumentLabel("didJoinedOfUid") uid : UInt, @argumentLabel("elapsed") elapsed : Int) {
+    emit('userJoined', { uid, elapsed } as UTSJSONObject)
+  }
+
+  rtcEngine(engine : AgoraRtcEngineKit, @argumentLabel("didOfflineOfUid") uid : UInt, @argumentLabel("reason") reason : AgoraUserOfflineReason) {
+    emit('userOffline', { uid, reason: reason.rawValue } as UTSJSONObject)
+  }
+
+  rtcEngine(engine : AgoraRtcEngineKit, @argumentLabel("connectionChangedTo") state : AgoraConnectionState, @argumentLabel("reason") reason : AgoraConnectionChangedReason) {
+    emit('connectionStateChanged', { state: state.rawValue, reason: reason.rawValue } as UTSJSONObject)
+  }
+
+  rtcEngine(engine : AgoraRtcEngineKit, @argumentLabel("remoteVideoStateChangedOfUid") uid : UInt, @argumentLabel("state") state : AgoraVideoRemoteState, @argumentLabel("reason") reason : AgoraVideoRemoteReason, @argumentLabel("elapsed") elapsed : Int) {
+    emit('remoteVideoStateChanged', { uid, state: state.rawValue, reason: reason.rawValue, elapsed } as UTSJSONObject)
+  }
+
+  rtcEngine(engine : AgoraRtcEngineKit, @argumentLabel("remoteAudioStateChangedOfUid") uid : UInt, @argumentLabel("state") state : AgoraAudioRemoteState, @argumentLabel("reason") reason : AgoraAudioRemoteReason, @argumentLabel("elapsed") elapsed : Int) {
+    emit('remoteAudioStateChanged', { uid, state: state.rawValue, reason: reason.rawValue, elapsed } as UTSJSONObject)
+  }
+
+  // uid=0 为本地预览；width/height 为旋转前尺寸，rotation 由 UI 归一。
+  rtcEngine(engine : AgoraRtcEngineKit, @argumentLabel("videoSizeChangedOf") sourceType : AgoraVideoSourceType, @argumentLabel("uid") uid : UInt, @argumentLabel("size") size : CGSize, @argumentLabel("rotation") rotation : Int) {
+    emit('videoSizeChanged', { uid, width: Int(size.width), height: Int(size.height), rotation } as UTSJSONObject)
+  }
+
+  rtcEngine(engine : AgoraRtcEngineKit, @argumentLabel("didOccurError") errorCode : AgoraErrorCode) {
+    emit('error', { code: errorCode.rawValue } as UTSJSONObject)
+  }
+}
+
+const rtcEventHandler = new AgoraRtcEventHandler()
+
+/** 只保留一个原生监听器，由 JS 层负责事件分发；RTC 事件需持续回调。 */
+@UTSJS.keepAlive
+export function setEventListener(callback : RtcEventCallback | null) {
+  eventCallback = callback
+}
+
+/** 按场景申请权限：语音场景只申请麦克风，避免因拒绝摄像头导致无法通话。 */
+@UTSJS.keepAlive
+export function requestPermissions(options : PermissionOptions, callback : (granted : boolean) => void) {
+  // 注意：UTS 编译到 Swift 时 `!==` 只支持类实例，boolean 比较会生成
+  // `Bool !== Bool` 并报 "argument type 'Bool' expected to be an instance of a class"。
+  // 布尔场景一律用 `!=`。
+  const wantVideo = options.video != false
+  const wantAudio = options.audio != false
+  if (!wantVideo && !wantAudio) {
+    callback(true)
+    return
+  }
+  if (wantVideo) {
+    AVCaptureDevice.requestAccess(for = AVMediaType.video, completionHandler = (videoGranted : boolean) => {
+      if (!wantAudio) {
+        callback(videoGranted)
+        return
+      }
+      AVCaptureDevice.requestAccess(for = AVMediaType.audio, completionHandler = (audioGranted : boolean) => {
+        callback(videoGranted && audioGranted)
+      })
+    })
+    return
+  }
+  AVCaptureDevice.requestAccess(for = AVMediaType.audio, completionHandler = (audioGranted : boolean) => {
+    callback(audioGranted)
+  })
+}
+
+export function createRtcEngine(appId : string) : number {
+  const normalizedAppId = appId.trim()
+  if (normalizedAppId.length == 0) return INVALID_ARGUMENT
+  if (rtcEngine != null) return currentAppId == normalizedAppId ? 0 : ENGINE_APP_ID_CHANGED
+
+  const config = new AgoraRtcEngineConfig()
+  config.appId = normalizedAppId
+  config.channelProfile = AgoraChannelProfile.communication
+  rtcEngine = AgoraRtcEngineKit.sharedEngine(with = config, delegate = rtcEventHandler)
+  currentAppId = normalizedAppId
+  emit('engineInitialized', { appId: normalizedAppId } as UTSJSONObject)
+  return 0
+}
+
+export function destroyRtcEngine() {
+  eventCallback = null
+  const engine = rtcEngine
+  if (engine != null) {
+    // 先退出频道再销毁，避免残留连接影响下一次入房。
+    try {
+      engine!.leaveChannel(nil)
+    } catch (leaveError) {
+      console.log(`[agora-rtc] leave before destroy: ${leaveError}`)
+    }
+  }
+  rtcEngine = null
+  currentAppId = ''
+  AgoraRtcEngineKit.destroy()
+}
+
+export function joinChannel(options : JoinChannelOptions) : number {
+  const engine = rtcEngine
+  if (engine == null) return ENGINE_NOT_CREATED
+  if (options.channelName.trim().length == 0) return INVALID_ARGUMENT
+  if (options.uid < 0 || options.uid > 2147483647 || options.uid % 1 != 0) return INVALID_ARGUMENT
+
+  const publishAudio = options.publishAudio ?? true
+  const publishVideo = options.publishVideo ?? true
+  const autoSubscribeAudio = options.autoSubscribeAudio ?? true
+  const autoSubscribeVideo = options.autoSubscribeVideo ?? true
+
+  // 纯语音场景不启用视频模块，避免重新拉起摄像头和本地预览。
+  if (publishAudio || autoSubscribeAudio) {
+    const audioResult = Number.from(engine!.enableAudio())
+    if (audioResult != 0) return audioResult
+  }
+  const frameRate = AgoraVideoFrameRate(rawValue = (options.videoEncoderFrameRate ?? 24).toInt()) ?? AgoraVideoFrameRate.fps24
+  let orientationMode = AgoraVideoOutputOrientationMode.adaptative
+  if (options.videoOrientationMode == 'portrait') {
+    orientationMode = AgoraVideoOutputOrientationMode.fixedPortrait
+  } else if (options.videoOrientationMode == 'landscape') {
+    orientationMode = AgoraVideoOutputOrientationMode.fixedLandscape
+  }
+  const encoderConfig = new AgoraVideoEncoderConfiguration(
+    width = (options.videoEncoderWidth ?? 960).toInt(),
+    height = (options.videoEncoderHeight ?? 540).toInt(),
+    frameRate = frameRate,
+    bitrate = AgoraVideoBitrateStandard,
+    orientationMode = orientationMode,
+    mirrorMode = AgoraVideoMirrorMode.auto
+  )
+  const encoderResult = Number.from(engine!.setVideoEncoderConfiguration(encoderConfig))
+  if (encoderResult != 0) return encoderResult
+  if (publishVideo || autoSubscribeVideo) {
+    const videoResult = Number.from(engine!.enableVideo())
+    if (videoResult != 0) return videoResult
+  }
+  const mediaOptions = new AgoraRtcChannelMediaOptions()
+  mediaOptions.channelProfile = AgoraChannelProfile.communication
+  mediaOptions.clientRoleType = AgoraClientRole.broadcaster
+  mediaOptions.publishMicrophoneTrack = publishAudio
+  mediaOptions.publishCameraTrack = publishVideo
+  mediaOptions.autoSubscribeAudio = autoSubscribeAudio
+  mediaOptions.autoSubscribeVideo = autoSubscribeVideo
+  const token = options.token ?? ''
+  return Number.from(engine!.joinChannel(byToken = token.length > 0 ? token : null, channelId = options.channelName, uid = options.uid.toUInt(), mediaOptions = mediaOptions, joinSuccess = null))
+}
+
+export function leaveChannel() : number {
+  const engine = rtcEngine
+  if (engine == null) return ENGINE_NOT_CREATED
+  return Number.from(engine!.leaveChannel(null))
+}
+
+export function startPreview() : number {
+  const engine = rtcEngine
+  if (engine == null) return ENGINE_NOT_CREATED
+  return Number.from(engine!.startPreview())
+}
+
+export function stopPreview() : number {
+  const engine = rtcEngine
+  if (engine == null) return ENGINE_NOT_CREATED
+  return Number.from(engine!.stopPreview())
+}
+
+export function enableLocalAudio(enabled : boolean) : number {
+  const engine = rtcEngine
+  if (engine == null) return ENGINE_NOT_CREATED
+  return Number.from(engine!.enableLocalAudio(enabled))
+}
+
+export function enableLocalVideo(enabled : boolean) : number {
+  const engine = rtcEngine
+  if (engine == null) return ENGINE_NOT_CREATED
+  return Number.from(engine!.enableLocalVideo(enabled))
+}
+
+/** 只停止发送本地音频，保留麦克风采集和音频会话；关闭麦克风请用 enableLocalAudio(false)。 */
+export function muteLocalAudioStream(muted : boolean) : number {
+  const engine = rtcEngine
+  if (engine == null) return ENGINE_NOT_CREATED
+  return Number.from(engine!.muteLocalAudioStream(muted))
+}
+
+/** 只停止发送本地视频，保留摄像头采集；关闭摄像头请用 enableLocalVideo(false)。 */
+export function muteLocalVideoStream(muted : boolean) : number {
+  const engine = rtcEngine
+  if (engine == null) return ENGINE_NOT_CREATED
+  return Number.from(engine!.muteLocalVideoStream(muted))
+}
+
+export function switchCamera() : number {
+  const engine = rtcEngine
+  if (engine == null) return ENGINE_NOT_CREATED
+  return Number.from(engine!.switchCamera())
+}
+
+/** true 使用扬声器，false 使用听筒；连接外部音频设备时以系统最终路由为准。 */
+export function setEnableSpeakerphone(enabled : boolean) : number {
+  const engine = rtcEngine
+  if (engine == null) return ENGINE_NOT_CREATED
+  return Number.from(engine!.setEnableSpeakerphone(enabled))
+}
+
+export function setupVideoView(view : UIView, uid : number, renderMode : string) : number {
+  const engine = rtcEngine
+  if (engine == null) return ENGINE_NOT_CREATED
+  if (uid < 0 || uid > 2147483647 || uid % 1 != 0) return INVALID_ARGUMENT
+
+  const canvas = new AgoraRtcVideoCanvas()
+  canvas.view = view
+  canvas.uid = uid.toUInt()
+  if (renderMode != 'fit' && renderMode != 'hidden') return INVALID_ARGUMENT
+  canvas.renderMode = renderMode == 'fit' ? AgoraVideoRenderMode.fit : AgoraVideoRenderMode.hidden
+  return Number.from(uid == 0 ? engine!.setupLocalVideo(canvas) : engine!.setupRemoteVideo(canvas))
+}
+
+export function clearVideoView(uid : number) : number {
+  const engine = rtcEngine
+  if (engine == null) return 0
+  if (uid < 0 || uid > 2147483647 || uid % 1 != 0) return INVALID_ARGUMENT
+  if (uid == 0) return Number.from(engine!.setupLocalVideo(null))
+
+  // iOS 的 setupRemoteVideo 参数非空，解绑远端画面时传 view=nil 的 Canvas。
+  const canvas = new AgoraRtcVideoCanvas()
+  canvas.uid = uid.toUInt()
+  canvas.view = null
+  return Number.from(engine!.setupRemoteVideo(canvas))
+}

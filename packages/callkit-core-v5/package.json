@@ -1,0 +1,54 @@
+{
+  "name": "@easemob-community/callkit-core-v5",
+  "version": "0.1.0",
+  "description": "Framework-agnostic call signaling core for Easemob IM SDK 5",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "unpkg": "./dist/index.umd.js",
+  "jsdelivr": "./dist/index.umd.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./umd": "./dist/index.umd.js",
+    "./iife": "./dist/index.iife.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "vite build && tsc -p tsconfig.build.json",
+    "dev": "vite build --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "typescript": "~5.8.3",
+    "vite": "^7.1.2",
+    "vitest": "^4.1.5"
+  },
+  "peerDependencies": {
+    "easemob-websdk": ">=5.0.0 <6.0.0"
+  },
+  "license": "MIT",
+  "author": "Easemob",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Easemob-Community/easemob-uikit-callkit.git",
+    "directory": "packages/callkit-core-v5"
+  },
+  "keywords": [
+    "easemob",
+    "chat",
+    "callkit",
+    "webrtc",
+    "agora",
+    "sdk5",
+    "uniapp"
+  ]
+}

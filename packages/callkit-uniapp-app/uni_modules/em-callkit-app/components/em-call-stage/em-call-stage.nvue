@@ -1,0 +1,666 @@
+<template>
+	<view v-if="view.visible" class="em-call-stage" :style="rootStyle">
+		<!--
+			一对多：agora-call-group 无呼叫页 / 无方向概念，
+			振铃阶段由本组件自绘遮罩 + 操作条；接通后仍是插件原生网格。
+		-->
+		<agora-call-group v-if="view.groupMode && mediaReady" ref="call" :key="componentKey" :app-id="view.appId"
+			:channel-name="view.channelName" :token="view.token" :uid="view.uid" :media-type="view.mediaType"
+			:theme="theme" :auto-join="false" :columns="groupColumns" :show-controls="!view.ringing"
+			:title="groupStageTitle" :pending-participants="pendingGroupParticipants"
+			:remote-profiles="view.groupRtcProfiles || {}"
+			:initial-audio-muted="view.audioMuted" :initial-video-muted="view.videoMuted"
+			video-orientation-mode="portrait"
+			@joined="handleJoined" @left="handleLeft" @user-joined="handleUserJoined" @user-offline="handleUserOffline"
+			@remote-audio-state-changed="handleRemoteAudioState" @remote-video-state-changed="handleRemoteVideoState"
+			@hangup="handleHangup" @error="handleError"
+			@audio-changed="handleAudioChanged" @video-changed="handleVideoChanged" />
+
+		<!-- 一对一：接通后是插件原生双窗 UI；振铃阶段被下方遮罩整屏盖住 -->
+		<!--
+			show-calling=false：否则遮罩撤掉后会再进一次插件的呼叫页
+			（callingVisible 在 joining 时就为真），形成「遮罩 → 插件呼叫页 → 视频」三层跳变。
+			ringtone-enabled 恒为 false：铃音统一由本组件播（见 syncRingtone），
+			插件只留画面。否则单聊来电会和自己播的 incoming.mp3 双响。
+		-->
+		<agora-call-one-to-one v-else-if="mediaReady" ref="call" :key="componentKey" :app-id="view.appId"
+			:channel-name="view.channelName" :token="view.token" :uid="view.uid" :media-type="view.mediaType"
+			:theme="theme" :auto-join="false" :show-calling="false" :ringtone-enabled="false"
+			:call-direction="view.callDirection" :ringing="view.ringing && !accepting"
+			:remote-name="view.remoteName" :remote-avatar="view.remoteAvatar"
+			:initial-audio-muted="view.audioMuted" :initial-video-muted="view.videoMuted"
+			:show-controls="!view.ringing"
+			video-orientation-mode="portrait"
+			@joined="handleJoined" @left="handleLeft" @user-joined="handleUserJoined" @user-offline="handleUserOffline"
+			@remote-audio-state-changed="handleRemoteAudioState" @remote-video-state-changed="handleRemoteVideoState"
+			@hangup="handleHangup" @error="handleError"
+			@audio-changed="handleAudioChanged" @video-changed="handleVideoChanged" />
+
+		<!--
+			振铃遮罩：整屏覆盖，为什么不用插件自带的呼叫页：
+			1. 主叫拿不到 appId/uid/token，agora-call-one-to-one 的呼叫页要求
+			   `joining || joined`（第 457 行只给 incoming+ringing 开了后门），渲不出来；
+			2. agora-call-group 完全没有呼叫页和振铃；
+			3. 插件呼叫页没有接听/拒接——文档原话「不包含邀请、振铃、接听/拒接等信令逻辑」。
+			单聊来电其实插件会显示微信式呼叫页，但为了和呼出、群聊统一，这里一并盖住。
+			铃音由本组件统一播（syncRingtone），遮罩只挡视觉，不影响声音。
+		-->
+		<view v-if="ringingVisible" class="incoming-cover" :style="coverStyle">
+			<view class="cover-avatar" :style="{ backgroundColor: colors.placeholder }">
+				<image v-if="view.remoteAvatar" class="cover-avatar-image" :src="view.remoteAvatar" mode="aspectFill" />
+				<text v-else class="cover-avatar-text" :style="{ color: colors.accent }">{{ avatarInitial }}</text>
+			</view>
+			<text class="cover-name" :style="{ color: colors.text }">{{ remoteLabel }}</text>
+			<text class="cover-hint" :style="{ color: colors.muted }">{{ hintText }}</text>
+
+			<view v-if="!waiting" class="cover-actions" :style="{ paddingBottom: actionsPadding + 'px' }">
+				<view v-if="isIncoming" class="action-btn" :style="{ backgroundColor: colors.danger }" @click="refuse">
+					<text class="action-text" :style="{ color: colors.text }">{{ rejectText }}</text>
+				</view>
+				<view v-if="isIncoming" class="action-btn" :style="{ backgroundColor: colors.accent }" @click="accept">
+					<text class="action-text" :style="{ color: colors.text }">{{ acceptText }}</text>
+				</view>
+				<view v-else class="action-btn" :style="{ backgroundColor: colors.danger }" @click="hangup">
+					<text class="action-text" :style="{ color: colors.text }">取消</text>
+				</view>
+			</view>
+		</view>
+	</view>
+</template>
+
+<script>
+// 显式注册而不靠 easycom：easycom 对 uni_modules 下 `.nvue` 的自动扫描在部分
+// HBuilderX 版本 / 编译缓存下会漏（表现为 Failed to resolve component），
+// 这类问题在真机上排查成本很高，直接 import 最省事。
+import AgoraCallOneToOne from '@/uni_modules/agora-rtc/components/agora-call-one-to-one/agora-call-one-to-one.nvue'
+import AgoraCallGroup from '@/uni_modules/agora-rtc/components/agora-call-group/agora-call-group.nvue'
+
+/**
+ * 铃音统一由本组件播，不交给 agora 组件，原因是：
+ * - 主叫呼出阶段组件还没渲染（拿不到 appId/uid），插件的 outgoing.mp3 永远不会响；
+ * - agora-call-group 根本没有振铃实现。
+ * 自己播之后单聊/群聊、呼出/呼入四套场景行为一致。
+ */
+const RINGTONES = {
+	incoming: '/uni_modules/agora-rtc/static/ringtones/incoming.mp3',
+	outgoing: '/uni_modules/agora-rtc/static/ringtones/outgoing.mp3'
+}
+
+/**
+ * App 端 innerAudioContext 读不到 /uni_modules 开头的绝对路径，
+ * 必须先映射成 _www 下的真实路径（插件也是这么做的）。
+ */
+function resolveRingtoneSource(source) {
+	try {
+		if (typeof plus === 'undefined' || !plus.io || typeof plus.io.convertLocalFileSystemURL !== 'function') {
+			return source
+		}
+		const isPackagePath = source.indexOf('/static/') === 0 || source.indexOf('/uni_modules/') === 0
+		return plus.io.convertLocalFileSystemURL(isPackagePath ? '_www' + source : source) || source
+	} catch (error) {
+		return source
+	}
+}
+
+/**
+ * em-call-stage —— 一屏通话组件（`rtcOwnership: 'component'` 配套）。
+ *
+ * 只吃 `view` 数据，不持有 core / bridge 实例。
+ * 原因是 nvue 页面与 vue 页面处于两个 JS 上下文，对象传不过来；
+ * 所有状态由宿主通过 `uni.$emit('em-callkit:view')` 推送，动作通过
+ * `uni.$emit('em-callkit:action')` 回传（见 callStageHost.ts）。
+ *
+ * 入房：组件固定 `autoJoin=false`，本组件监听 `view.shouldJoin` 变 true 后
+ * 自己调 `ref.join()`——此时 props 已全部就绪，不存在时序问题。
+ */
+export default {
+	name: 'em-call-stage',
+	components: {
+		AgoraCallOneToOne,
+		AgoraCallGroup
+	},
+	props: {
+		/** 宿主推送的通话快照，纯 JSON（CallViewProps） */
+		view: {
+			type: Object,
+			required: true
+		},
+		/** 透传给 agora-rtc 的主题，见插件 ui.d.ts 的 AgoraCallTheme */
+		theme: {
+			type: Object,
+			default: () => ({})
+		},
+		/** 群聊网格列数 1~4 */
+		groupColumns: {
+			type: Number,
+			default: 3
+		},
+		acceptText: {
+			type: String,
+			default: '接听'
+		},
+		rejectText: {
+			type: String,
+			default: '拒绝'
+		}
+	},
+	emits: ['accept', 'refuse', 'hangup', 'audio-changed', 'video-changed', 'media-command-failed', 'rtc-report', 'error'],
+	data() {
+		return {
+			// 已调用过 join()，避免 watch 多次触发重复入房
+			joined: false,
+			// 已点接听、等主叫 confirmCallee 回执的窗口（正常百毫秒级，最坏 10s 超时）
+			accepting: false,
+			joinedUid: 0,
+			mediaEpoch: 0,
+			stageDisposed: false,
+			// 当前在播的铃音（'' / 'incoming' / 'outgoing'）与它的播放器
+			ringtoneKind: '',
+			ringtoneContext: null,
+			// 延迟起播的定时器，短窗口（群聊主叫）会被直接取消
+			ringtoneTimer: null,
+			audioQueue: { running: false, pending: null, lastQueuedId: -1 },
+			videoQueue: { running: false, pending: null, lastQueuedId: -1 }
+		}
+	},
+	computed: {
+		componentKey() {
+			return JSON.stringify([this.view.callId, this.view.appId, this.view.channelName, this.view.uid, this.view.mediaType, this.view.groupMode])
+		},
+		/** appId / channelName / uid 三者齐备才能入房，缺一个组件会静默失败 */
+		mediaReady() {
+			return Boolean(this.view.appId && this.view.channelName && Number(this.view.uid) > 0)
+		},
+		isIncoming() {
+			return this.view.callDirection === 'incoming'
+		},
+		ringingVisible() {
+			return Boolean(this.view.visible && this.view.ringing)
+		},
+		/**
+		 * 当前该响哪种铃，'' 表示静音。
+		 * - 来电：振铃中且还没点接听 → incoming；点了接听立刻停
+		 * - 呼出：振铃中（等对方接听）→ outgoing
+		 * 单聊和群聊共用这套判断，因为 callDirection / ringing 是通用字段。
+		 */
+		wantedRingtone() {
+			if (!this.view.visible || !this.view.ringing) return ''
+			if (this.view.callDirection === 'incoming') return this.accepting ? '' : 'incoming'
+			return 'outgoing'
+		},
+		/** 点过接听之后就不再显示按钮，避免二次点击 */
+		waiting() {
+			return Boolean(this.accepting && this.isIncoming)
+		},
+		avatarInitial() {
+			const name = String(this.view.remoteName || '')
+			return name ? name.slice(0, 1) : '?'
+		},
+		/** 群聊主叫等待态：现有网格不动，仅补充标题与未入房占位。 */
+		groupStageTitle() {
+			if (this.view.groupMode && this.view.callDirection === 'outgoing' && this.view.groupWaiting) {
+				return '等待接听'
+			}
+			return this.view.mediaType === 'video' ? '多人音视频通话' : '多人语音通话'
+		},
+		pendingGroupParticipants() {
+			if (!this.view.groupMode) return []
+			const participants = Array.isArray(this.view.groupParticipants) ? this.view.groupParticipants : []
+			const joinedUserIds = {}
+			const profiles = this.view.groupRtcProfiles || {}
+			Object.keys(profiles).forEach((uid) => {
+				const profile = profiles[uid]
+				if (profile && profile.userId) joinedUserIds[profile.userId] = true
+			})
+			// 保留“等待接听/正在加入”的占位；RTC UID 一旦映射到该 userId，
+			// 同一张占位卡交给原生成员卡接管，不会新增第二张卡。
+			return participants.filter((participant) => participant &&
+				participant.state !== 'joinedRtc' &&
+				participant.state !== 'left' &&
+				!joinedUserIds[participant.userId])
+		},
+		remoteLabel() {
+			// 群聊优先显示群名；没有群名就退到主叫昵称，再退到「群聊通话」
+			if (this.view.groupName) return this.view.groupName
+			if (this.view.remoteName) return this.view.remoteName
+			return this.view.groupMode ? '群聊通话' : '对方'
+		},
+		/** 群聊时把主叫放进副标题，避免标题被群名占满后不知道谁发起 */
+		callerHint() {
+			if (!this.view.groupMode) return ''
+			const name = String(this.view.remoteName || '')
+			if (!name || name === this.view.groupName) return ''
+			return name
+		},
+		hintText() {
+			if (this.waiting) return '正在接通…'
+			const type = this.view.mediaType === 'video' ? '视频' : '语音'
+			if (this.isIncoming) {
+				return this.callerHint ? `${this.callerHint} 邀请你${type}通话` : `邀请你${type}通话`
+			}
+			return `正在呼叫${type}通话…`
+		},
+		colors() {
+			const theme = this.theme || {}
+			return {
+				text: theme.textColor || '#ffffff',
+				muted: theme.mutedTextColor || 'rgba(255, 255, 255, 0.72)',
+				accent: theme.accentColor || '#4d7cfe',
+				danger: theme.dangerColor || '#ff3b30',
+				placeholder: theme.placeholderBackgroundColor || '#1b1e25',
+				background: theme.backgroundColor || '#0b0b0f'
+			}
+		},
+		rootStyle() {
+			return { backgroundColor: this.colors.background }
+		},
+		coverStyle() {
+			return { backgroundColor: this.colors.background }
+		},
+		actionsPadding() {
+			// 与插件一致：iPhone 底部安全区
+			try {
+				const info = uni.getSystemInfoSync()
+				return Number(info && info.safeAreaInsets && info.safeAreaInsets.bottom) || 0
+			} catch (error) {
+				return 0
+			}
+		}
+	},
+	watch: {
+		'view.shouldJoin'(next) {
+			if (next) this.joinCall()
+		},
+		'view.audioCommandId'() {
+			this.applyMediaCommands()
+		},
+		'view.videoCommandId'() {
+			this.applyMediaCommands()
+		},
+		/**
+		 * 主叫在 shouldJoinRtc 之前没有 appId/uid，组件是「稍后」才渲染出来的：
+		 * shouldJoin 先到、mediaReady 后到，这条 watch 负责补上入房。
+		 */
+		mediaReady(next) {
+			if (!next) this.resetCallComponent()
+			else if (this.view.visible && this.view.shouldJoin) this.joinCall()
+		},
+		'view.callId'() {
+			this.resetCallComponent()
+			if (this.view.visible && this.view.shouldJoin) this.joinCall()
+		},
+		'view.channelName'() {
+			this.resetCallComponent()
+			if (this.view.visible && this.view.shouldJoin) this.joinCall()
+		},
+		'view.uid'() {
+			this.resetCallComponent()
+			if (this.view.visible && this.view.shouldJoin) this.joinCall()
+		},
+		'view.appId'() {
+			this.resetCallComponent()
+			if (this.view.visible && this.view.shouldJoin) this.joinCall()
+		},
+		'view.mediaType'() {
+			this.resetCallComponent()
+			if (this.view.visible && this.view.shouldJoin) this.joinCall()
+		},
+		'view.visible'(next) {
+			if (!next) {
+				this.accepting = false
+				this.resetCallComponent()
+			}
+		},
+		'view.groupMode'() {
+			// 单聊/群聊组件切换会重建 ref，必须允许重新 join
+			this.resetCallComponent()
+			if (this.view.visible && this.view.shouldJoin) this.joinCall()
+		},
+		'view.ringing'(next) {
+			// 振铃结束（shouldJoinRtc / 挂断）就退出「正在接通」态
+			if (!next) this.accepting = false
+		},
+		/** 铃音只跟着 wantedRingtone 走，其余状态变化不重复触发播放 */
+		wantedRingtone(next) {
+			this.syncRingtone(next)
+		}
+	},
+	created() {
+		this.mediaTarget = null
+	},
+	mounted() {
+		if (this.view.visible && this.view.shouldJoin) this.joinCall()
+		// 页面可能在振铃中途才渲染出来，这里补一次，不依赖 watch 首次触发
+		if (this.wantedRingtone) this.syncRingtone(this.wantedRingtone)
+	},
+	updated() {
+		if (this.stageDisposed || !this.view.visible || !this.mediaReady) return
+		const target = this.$refs.call
+		if (target && this.mediaTarget !== target) {
+			this.resetCallComponent()
+			this.mediaTarget = target
+			if (this.view.shouldJoin) this.joinCall()
+		}
+	},
+	beforeDestroy() {
+		this.disposeStage()
+	},
+	beforeUnmount() {
+		this.disposeStage()
+	},
+	methods: {
+		resetMediaQueues() {
+			this.mediaEpoch += 1
+			this.audioQueue = { running: false, pending: null, lastQueuedId: -1 }
+			this.videoQueue = { running: false, pending: null, lastQueuedId: -1 }
+		},
+		resetCallComponent() {
+			this.joined = false
+			this.joinedUid = 0
+			this.mediaTarget = null
+			this.resetMediaQueues()
+			// 换通话/退场时铃音必须立刻停，否则会串到下一通
+			this.stopRingtone()
+		},
+		syncRingtone(kind) {
+			this.cancelRingtoneStart()
+			if (this.stageDisposed || !kind) {
+				this.stopRingtone()
+				return
+			}
+			// 同一种铃已经在响就复用，避免 watch 抖动导致重播
+			if (this.ringtoneKind === kind && this.ringtoneContext) return
+			this.stopRingtone()
+			/*
+			 * 延迟起播：群聊主叫在 inviteGroupCall 内部就 receiveAnswer('accept') 了，
+			 * 从 singleCallInvited 到 shouldJoinRtc 只有几百毫秒，
+			 * 立刻起播会变成半声「咔」。短窗口直接跳过，单聊呼出等几十秒的场景无感。
+			 */
+			this.ringtoneTimer = setTimeout(() => {
+				this.ringtoneTimer = null
+				if (this.stageDisposed || this.wantedRingtone !== kind) return
+				this.startRingtone(kind)
+			}, 260)
+		},
+		startRingtone(kind) {
+			if (typeof uni === 'undefined' || typeof uni.createInnerAudioContext !== 'function') {
+				console.warn('[em-call-stage] 当前平台不支持 innerAudioContext，跳过铃音')
+				return
+			}
+			try {
+				const context = uni.createInnerAudioContext()
+				context.loop = true
+				context.volume = 1
+				try {
+					// 来电/回铃音不受 iOS 静音键影响，否则用户开静音就完全听不到
+					context.obeyMuteSwitch = false
+				} catch (error) {
+					// 部分平台不支持该属性，忽略
+				}
+				context.onError((error) => {
+					console.warn('[em-call-stage] 铃音播放失败', error)
+				})
+				context.src = resolveRingtoneSource(RINGTONES[kind])
+				context.play()
+				this.ringtoneContext = context
+				this.ringtoneKind = kind
+			} catch (error) {
+				console.warn('[em-call-stage] 创建铃音失败', error)
+				this.ringtoneContext = null
+				this.ringtoneKind = ''
+			}
+		},
+		cancelRingtoneStart() {
+			if (!this.ringtoneTimer) return
+			clearTimeout(this.ringtoneTimer)
+			this.ringtoneTimer = null
+		},
+		stopRingtone() {
+			this.cancelRingtoneStart()
+			const context = this.ringtoneContext
+			this.ringtoneContext = null
+			this.ringtoneKind = ''
+			if (!context) return
+			try {
+				context.stop()
+			} catch (error) {
+				// 未开始播放时 stop 会报错，忽略
+			}
+			try {
+				context.destroy()
+			} catch (error) {
+				// 已销毁，忽略
+			}
+		},
+		disposeStage() {
+			if (this.stageDisposed) return
+			this.stageDisposed = true
+			this.resetCallComponent()
+		},
+		joinCall() {
+			const epoch = this.mediaEpoch
+			this.$nextTick(() => {
+				if (this.stageDisposed || epoch !== this.mediaEpoch || !this.view.visible || !this.view.shouldJoin || this.joined || !this.mediaReady) return
+				const target = this.$refs.call
+				if (!target || typeof target.join !== 'function') return
+				this.mediaTarget = target
+				this.joined = true
+				Promise.resolve().then(() => {
+					if (this.stageDisposed || epoch !== this.mediaEpoch || target !== this.$refs.call) return
+					return target.join()
+				}).catch((error) => {
+					if (this.stageDisposed || epoch !== this.mediaEpoch || target !== this.$refs.call) return
+					this.joined = false
+					this.$emit('error', error)
+				})
+			})
+		},
+		emitRtcReport(type, payload) {
+			this.$emit('rtc-report', { type, payload })
+		},
+		applyMediaCommands() {
+			if (this.stageDisposed || !this.view.visible || !this.joinedUid) return
+			const target = this.$refs.call
+			if (!target) return
+			for (const kind of ['audio', 'video']) {
+				const queue = this[kind + 'Queue']
+				const id = Number(this.view[kind + 'CommandId']) || 0
+				const method = kind === 'audio' ? 'setAudioMuted' : 'setVideoMuted'
+				if (id <= 0 || id <= queue.lastQueuedId || typeof target[method] !== 'function') continue
+				queue.lastQueuedId = id
+				queue.pending = { id, muted: Boolean(this.view[kind + 'Muted']) }
+				this.drainMediaQueue(kind)
+			}
+		},
+		async drainMediaQueue(kind) {
+			const queue = this[kind + 'Queue']
+			if (queue.running || !queue.pending || this.stageDisposed) return
+			const request = queue.pending
+			queue.pending = null
+			queue.running = true
+			const epoch = this.mediaEpoch
+			const target = this.$refs.call
+			const current = () => !this.stageDisposed && epoch === this.mediaEpoch && target === this.$refs.call
+			try {
+				const method = kind === 'audio' ? 'setAudioMuted' : 'setVideoMuted'
+				await target[method](request.muted)
+				if (current()) this.$emit(kind + '-changed', { muted: request.muted, commandId: request.id })
+			} catch (error) {
+				if (current()) {
+					this.$emit('media-command-failed', {
+						kind,
+						commandId: request.id,
+						error: String((error && error.message) || error)
+					})
+				}
+			} finally {
+				queue.running = false
+			}
+			if (current() && queue.pending) this.drainMediaQueue(kind)
+		},
+		handleJoined(data) {
+			if (this.stageDisposed || !this.view.visible) return
+			this.mediaTarget = this.$refs.call
+			this.joinedUid = Number(data && data.uid) || Number(this.view.uid) || 0
+			this.emitRtcReport('rtcJoined', { uid: this.joinedUid })
+			// join 前到达的命令在原生引擎就绪后按最新快照补齐。
+			this.applyMediaCommands()
+		},
+		handleLeft() {
+			const uid = this.joinedUid || Number(this.view.uid) || 0
+			this.resetCallComponent()
+			this.emitRtcReport('rtcLeft', { uid })
+		},
+		handleUserJoined(data) {
+			this.emitRtcReport('userJoined', { uid: Number(data && data.uid) })
+		},
+		handleUserOffline(data) {
+			this.emitRtcReport('userLeft', { uid: Number(data && data.uid) })
+		},
+		handleRemoteAudioState(data) {
+			const state = Number(data && data.state)
+			if (state !== 0 && state !== 2 && state !== 4) return
+			this.emitRtcReport(state === 2 ? 'userAudioUnmuted' : 'userAudioMuted', {
+				uid: Number(data && data.uid)
+			})
+		},
+		handleRemoteVideoState(data) {
+			const state = Number(data && data.state)
+			if (state !== 0 && state !== 2 && state !== 4) return
+			this.emitRtcReport(state === 2 ? 'userVideoUnmuted' : 'userVideoMuted', {
+				uid: Number(data && data.uid)
+			})
+		},
+		accept() {
+			if (this.accepting) return
+			this.accepting = true
+			this.$emit('accept')
+		},
+		refuse() {
+			this.accepting = false
+			this.$emit('refuse')
+		},
+		hangup() {
+			this.$emit('hangup')
+		},
+		handleHangup() {
+			// 振铃中按插件自带的「取消」= 拒接，不能当成挂断（此时还没接通）
+			if (this.ringingVisible) {
+				if (this.isIncoming) this.refuse()
+				else this.hangup()
+				return
+			}
+			this.$emit('hangup')
+		},
+		handleError(error) {
+			this.$emit('error', error)
+			const code = Number(error && error.code)
+			this.emitRtcReport('error', {
+				error: String((error && (error.userMessage || error.message)) || error || 'RTC 原生错误'),
+				errorCode: Number.isFinite(code) ? code : undefined
+			})
+		},
+		handleAudioChanged(payload) {
+			if (this.stageDisposed || !this.view.visible || this.audioQueue.running) return
+			this.$emit('audio-changed', payload)
+		},
+		handleVideoChanged(payload) {
+			if (this.stageDisposed || !this.view.visible || this.videoQueue.running) return
+			this.$emit('video-changed', payload)
+		}
+	}
+}
+</script>
+
+<style scoped>
+/*
+ * nvue 中 view 默认 flex column，但「文字看起来没居中」通常是两个原因：
+ * 1) 文字所在的 flex item 没有 align-items/justify-content（或被 flex:1 拉伸后 text-align 仍是 left）
+ * 2) 容器用 absolute 定位但没给左右边距，长文本贴边
+ * 下面统一：容器居中 + 文本 text-align: center（双保险）。
+ */
+.em-call-stage {
+	flex: 1;
+	width: 750rpx;
+	position: relative;
+}
+
+.incoming-cover {
+	position: absolute;
+	left: 0;
+	right: 0;
+	top: 0;
+	bottom: 0;
+	align-items: center;
+	justify-content: center;
+	padding-left: 24px;
+	padding-right: 24px;
+}
+
+.cover-avatar {
+	width: 104px;
+	height: 104px;
+	border-radius: 52px;
+	align-items: center;
+	justify-content: center;
+	overflow: hidden;
+	margin-bottom: 20px;
+	border-width: 2px;
+	border-style: solid;
+	border-color: rgba(255, 255, 255, 0.12);
+}
+
+.cover-avatar-image {
+	width: 104px;
+	height: 104px;
+	border-radius: 50px;
+}
+
+.cover-avatar-text {
+	font-size: 38px;
+	line-height: 44px;
+	text-align: center;
+}
+
+.cover-name {
+	font-size: 22px;
+	line-height: 30px;
+	margin-bottom: 10px;
+	text-align: center;
+}
+
+.cover-hint {
+	font-size: 15px;
+	line-height: 22px;
+	text-align: center;
+}
+
+.cover-actions {
+	position: absolute;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	flex-direction: row;
+	align-items: center;
+	padding-top: 40px;
+	padding-left: 26px;
+	padding-right: 26px;
+}
+
+.action-btn {
+	flex: 1;
+	height: 50px;
+	border-radius: 25px;
+	flex-direction: row;
+	align-items: center;
+	justify-content: center;
+	margin-left: 6px;
+	margin-right: 6px;
+}
+
+.action-text {
+	font-size: 16px;
+	line-height: 22px;
+	text-align: center;
+}
+</style>

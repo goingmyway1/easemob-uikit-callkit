@@ -1,0 +1,23 @@
+export type JoinChannelOptions = {
+  channelName: string
+  token?: string
+  uid: number
+  publishAudio?: boolean
+  publishVideo?: boolean
+  autoSubscribeAudio?: boolean
+  autoSubscribeVideo?: boolean
+  videoEncoderWidth?: number
+  videoEncoderHeight?: number
+  videoEncoderFrameRate?: number
+  /** 推流方向：adaptive（跟随采集）/ portrait（强制竖屏）/ landscape（强制横屏），默认 adaptive。 */
+  videoOrientationMode?: string
+}
+
+/** 按场景申请权限：语音场景传 { audio: true, video: false }。 */
+export type PermissionOptions = {
+  audio?: boolean
+  video?: boolean
+}
+
+/** event 为事件名，data 的字段随事件变化，详见 readme.md。 */
+export type RtcEventCallback = (event: string, data: UTSJSONObject) => void

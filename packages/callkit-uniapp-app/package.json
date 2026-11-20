@@ -1,0 +1,24 @@
+{
+  "name": "@easemob-community/callkit-uniapp-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "UniApp Android/iOS adapter for Easemob CallKit SDK 5",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@easemob-community/callkit-core-v5": "workspace:*"
+  },
+  "peerDependencies": {
+    "easemob-websdk": ">=5.0.0 <6.0.0"
+  },
+  "devDependencies": {
+    "easemob-websdk": "5.2.0",
+    "typescript": "~5.8.3",
+    "vitest": "^4.1.5"
+  },
+  "license": "MIT"
+}

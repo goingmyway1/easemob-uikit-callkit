@@ -1,0 +1,101 @@
+<template>
+  <view class="em-call-video-view">
+    <agora-video-view
+      ref="nativeVideo"
+      :render-mode="renderMode"
+      :render-type="renderType"
+      :corner-radius="cornerRadius"
+      @bind-error="onBindError"
+    />
+  </view>
+</template>
+
+<script>
+export default {
+  name: 'EmCallVideoView',
+  emits: ['bind-error'],
+  props: {
+    uid: {
+      type: [Number, String],
+      default: 0
+    },
+    renderMode: {
+      type: String,
+      default: 'hidden'
+    },
+    renderType: {
+      type: String,
+      default: 'texture'
+    },
+    cornerRadius: {
+      type: Number,
+      default: 0
+    },
+    active: {
+      type: Boolean,
+      default: true
+    }
+  },
+  watch: {
+    uid() {
+      this.refresh()
+    },
+    active(value) {
+      if (value) this.refresh()
+      else this.unbindVideo()
+    }
+  },
+  mounted() {
+    this.refresh()
+  },
+  // 插件只声明 vue3，卸载钩子是 beforeUnmount；
+  // beforeDestroy 仅作 Vue2 内核基座的兜底（unbindVideo 幂等，重复调用无副作用）
+  beforeUnmount() {
+    this.unbindVideo()
+  },
+  beforeDestroy() {
+    this.unbindVideo()
+  },
+  methods: {
+    normalizeUid() {
+      const value = Number(this.uid)
+      if (!Number.isInteger(value) || value < 0 || value > 2147483647) return null
+      return value
+    },
+    refresh() {
+      if (!this.active) return this.unbindVideo()
+      this.$nextTick(() => this.bindVideo(this.normalizeUid()))
+    },
+    bindVideo(uid) {
+      if (uid === null) {
+        // uid 非法时必须让宿主感知，否则只会得到一块永久黑屏
+        this.$emit('bind-error', { code: -2, uid: this.uid, operation: 'bindVideo' })
+        return -2
+      }
+      const view = this.$refs.nativeVideo
+      if (!view || typeof view.bindVideo !== 'function') return -1
+      const result = view.bindVideo(uid)
+      // iOS nvue 方法调用成功也可能返回 null/undefined，只有数字错误码才可上报。
+      if (typeof result === 'number' && result !== 0) {
+        this.$emit('bind-error', { code: result, uid, operation: 'bindVideo' })
+      }
+      return result
+    },
+    unbindVideo() {
+      const view = this.$refs.nativeVideo
+      if (!view || typeof view.unbindVideo !== 'function') return -1
+      return view.unbindVideo()
+    },
+    onBindError(event) {
+      this.$emit('bind-error', event)
+    }
+  }
+}
+</script>
+
+<style scoped>
+.em-call-video-view {
+  flex: 1;
+  overflow: hidden;
+}
+</style>

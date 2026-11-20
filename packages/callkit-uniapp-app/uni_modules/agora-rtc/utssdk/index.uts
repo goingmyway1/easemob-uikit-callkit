@@ -1,0 +1,40 @@
+// JS Facade 使用命名导入；这里也必须显式导出，export * 不会生成 nvue UTS 函数代理。
+// #ifdef APP-ANDROID
+export {
+  setEventListener,
+  requestPermissions,
+  createRtcEngine,
+  destroyRtcEngine,
+  joinChannel,
+  leaveChannel,
+  startPreview,
+  stopPreview,
+  enableLocalAudio,
+  enableLocalVideo,
+  muteLocalAudioStream,
+  muteLocalVideoStream,
+  switchCamera,
+  setEnableSpeakerphone
+} from './app-android/index.uts'
+// #endif
+
+// #ifdef APP-IOS
+export {
+  setEventListener,
+  requestPermissions,
+  createRtcEngine,
+  destroyRtcEngine,
+  joinChannel,
+  leaveChannel,
+  startPreview,
+  stopPreview,
+  enableLocalAudio,
+  enableLocalVideo,
+  muteLocalAudioStream,
+  muteLocalVideoStream,
+  switchCamera,
+  setEnableSpeakerphone
+} from './app-ios/index.uts'
+// #endif
+
+export * from './interface.uts'

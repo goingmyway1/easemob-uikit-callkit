@@ -1,0 +1,62 @@
+{
+  "name": "em-callkit-app",
+  "id": "em-callkit-app",
+  "displayName": "环信 CallKit SDK5 App",
+  "version": "0.1.0",
+  "description": "环信 CallKit UniApp Android/iOS 适配插件，基于 easemob-websdk 5.x 与 agora-rtc",
+  "keywords": [
+    "easemob",
+    "callkit",
+    "sdk5",
+    "uniapp",
+    "agora",
+    "audio-call",
+    "video-call"
+  ],
+  "license": "MIT",
+  "author": "Easemob",
+  "repository": "https://github.com/Easemob-Community/easemob-uikit-callkit/tree/feat/callkit-sdk-5.0/packages/callkit-uniapp-app",
+  "engines": {
+    "HBuilderX": "^4.0.0"
+  },
+  "peerDependencies": {
+    "easemob-websdk": "^5.0.0",
+    "@easemob-community/callkit-core-v5": "^0.1.0"
+  },
+  "uni_modules": {
+    "dependencies": [
+      "agora-rtc"
+    ],
+    "encrypt": [],
+    "platforms": {
+      "client": {
+        "uni-app": {
+          "vue": {
+            "vue2": "x",
+            "vue3": "y"
+          },
+          "app": {
+            "android": "y",
+            "ios": "y",
+            "harmony": "x"
+          },
+          "web": {
+            "safari": "x",
+            "chrome": "x"
+          },
+          "mp": {
+            "weixin": "x",
+            "alipay": "x",
+            "toutiao": "x",
+            "baidu": "x",
+            "kuaishou": "x",
+            "jd": "x",
+            "qq": "x",
+            "lark": "x",
+            "xhs": "x"
+          }
+        }
+      }
+    }
+  }
+}

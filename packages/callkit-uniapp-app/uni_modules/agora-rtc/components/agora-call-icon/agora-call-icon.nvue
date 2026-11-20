@@ -1,0 +1,71 @@
+<template>
+	<image class="agora-call-icon" :src="iconSource" :style="iconStyle" mode="aspectFit" />
+</template>
+
+<script>
+	import microphone from '../../static/icons/microphone.png'
+	import microphoneOff from '../../static/icons/microphone-off.png'
+	import video from '../../static/icons/video.png'
+	import videoOff from '../../static/icons/video-off.png'
+	import cameraSwitch from '../../static/icons/camera-switch.png'
+	import speaker from '../../static/icons/speaker.png'
+	import earpiece from '../../static/icons/earpiece.png'
+	import hangup from '../../static/icons/hangup.png'
+	import collapse from '../../static/icons/collapse.png'
+	import userPlus from '../../static/icons/user-plus.png'
+	import user from '../../static/icons/user.png'
+
+	const ICONS = {
+		microphone,
+		'microphone-off': microphoneOff,
+		video,
+		'video-off': videoOff,
+		'camera-switch': cameraSwitch,
+		speaker,
+		earpiece,
+		hangup,
+		collapse,
+		'user-plus': userPlus,
+		user
+	}
+
+	/**
+	 * 默认使用导出的通话 PNG 资源；业务可用具名图标插槽替换视觉资源。
+	 */
+	export default {
+		name: 'AgoraCallIcon',
+		props: {
+			name: {
+				type: String,
+				required: true
+			},
+			size: {
+				type: Number,
+				default: 28
+			}
+		},
+		computed: {
+			iconSource() {
+				return ICONS[this.name] || microphone
+			},
+			iconStyle() {
+				const size = Math.max(12, Number(this.size) || 28)
+				const style = {
+					width: size + 'px',
+					height: size + 'px'
+				}
+				if (this.name === 'user') {
+					style.borderRadius = size / 2 + 'px'
+				}
+				return style
+			}
+		}
+	}
+</script>
+
+<style>
+	.agora-call-icon {
+		width: 28px;
+		height: 28px;
+	}
+</style>

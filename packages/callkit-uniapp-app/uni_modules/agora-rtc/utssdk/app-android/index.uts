@@ -1,0 +1,278 @@
+import View from 'android.view.View'
+import Build from 'android.os.Build'
+import {
+  ChannelMediaOptions,
+  Constants,
+  IRtcEngineEventHandler,
+  RtcEngine,
+  RtcEngineConfig
+} from 'io.agora.rtc2'
+import RtcStats from 'io.agora.rtc2.IRtcEngineEventHandler.RtcStats'
+import VideoSourceType from 'io.agora.rtc2.Constants.VideoSourceType'
+import VideoCanvas from 'io.agora.rtc2.video.VideoCanvas'
+import VideoEncoderConfiguration from 'io.agora.rtc2.video.VideoEncoderConfiguration'
+import VideoDimensions from 'io.agora.rtc2.video.VideoEncoderConfiguration.VideoDimensions'
+import ORIENTATION_MODE from 'io.agora.rtc2.video.VideoEncoderConfiguration.ORIENTATION_MODE'
+import { JoinChannelOptions, PermissionOptions, RtcEventCallback } from '../interface.uts'
+
+const INVALID_ARGUMENT = -2
+const ENGINE_NOT_CREATED = -1001
+const ENGINE_APP_ID_CHANGED = -1002
+
+var rtcEngine: RtcEngine | null = null
+var rtcAppId = ''
+var rtcEventCallback: RtcEventCallback | null = null
+
+function emit(event: string, data: UTSJSONObject) {
+  rtcEventCallback?.(event, data)
+}
+
+class AgoraRtcEventHandler extends IRtcEngineEventHandler {
+  constructor() {
+    super()
+  }
+
+  override onJoinChannelSuccess(channel: string, uid: Int, elapsed: Int) {
+    emit('joinChannelSuccess', { channel, uid, elapsed } as UTSJSONObject)
+  }
+
+  override onLeaveChannel(stats: RtcStats) {
+    emit('leaveChannel', { duration: stats.totalDuration } as UTSJSONObject)
+  }
+
+  override onUserJoined(uid: Int, elapsed: Int) {
+    emit('userJoined', { uid, elapsed } as UTSJSONObject)
+  }
+
+  override onUserOffline(uid: Int, reason: Int) {
+    emit('userOffline', { uid, reason } as UTSJSONObject)
+  }
+
+  override onConnectionStateChanged(state: Int, reason: Int) {
+    emit('connectionStateChanged', { state, reason } as UTSJSONObject)
+  }
+
+  override onRemoteVideoStateChanged(uid: Int, state: Int, reason: Int, elapsed: Int) {
+    emit('remoteVideoStateChanged', { uid, state, reason, elapsed } as UTSJSONObject)
+  }
+
+  override onRemoteAudioStateChanged(uid: Int, state: Int, reason: Int, elapsed: Int) {
+    emit('remoteAudioStateChanged', { uid, state, reason, elapsed } as UTSJSONObject)
+  }
+
+  // uid=0 为本地预览；width/height 为旋转前尺寸，rotation 由 UI 归一。
+  override onVideoSizeChanged(source: VideoSourceType, uid: Int, width: Int, height: Int, rotation: Int) {
+    emit('videoSizeChanged', { uid, width, height, rotation } as UTSJSONObject)
+  }
+
+  override onError(err: Int) {
+    emit('error', { code: err } as UTSJSONObject)
+  }
+}
+
+const rtcEventHandler = new AgoraRtcEventHandler()
+
+/** 只保留一个原生监听器，由 JS 层负责事件分发；RTC 事件需持续回调。 */
+@UTSJS.keepAlive
+export function setEventListener(callback : RtcEventCallback | null) {
+  rtcEventCallback = callback
+}
+
+/** 按场景申请采集权限；语音不申请摄像头，Android 12+ 音频场景附加可选蓝牙权限。 */
+@UTSJS.keepAlive
+export function requestPermissions(options: PermissionOptions, callback: (granted: boolean) => void) {
+  const permissions: string[] = []
+  if (options.video != false) permissions.push('android.permission.CAMERA')
+  if (options.audio != false) permissions.push('android.permission.RECORD_AUDIO')
+  const needBluetoothPermission = options.audio != false && Build.VERSION.SDK_INT >= 31
+  const bluetoothPermissions: string[] = []
+  if (needBluetoothPermission) bluetoothPermissions.push('android.permission.BLUETOOTH_CONNECT')
+  if (permissions.length == 0) {
+    callback(true)
+    return
+  }
+  UTSAndroid.requestSystemPermission(
+    UTSAndroid.getUniActivity()!,
+    permissions,
+    (allRight: boolean, _grantedList: string[]) => {
+      if (!allRight || !needBluetoothPermission) {
+        callback(allRight)
+        return
+      }
+      // 蓝牙只影响可选音频路由，拒绝后仍返回已获批的基础通话权限结果。
+      UTSAndroid.requestSystemPermission(
+        UTSAndroid.getUniActivity()!,
+        bluetoothPermissions,
+        (_allRight: boolean, _bluetoothGrantedList: string[]) => callback(true),
+        (_bluetoothDoNotAskAgain: boolean, _bluetoothGrantedList: string[]) => callback(true)
+      )
+    },
+    (_baseDoNotAskAgain: boolean, _grantedList: string[]) => callback(false)
+  )
+}
+
+export function createRtcEngine(appId: string): number {
+  const normalizedAppId = appId.trim()
+  if (normalizedAppId.length == 0) return INVALID_ARGUMENT
+  if (rtcEngine != null) return rtcAppId == normalizedAppId ? 0 : ENGINE_APP_ID_CHANGED
+
+  try {
+    const config = new RtcEngineConfig()
+    config.mContext = UTSAndroid.getAppContext()!
+    config.mAppId = normalizedAppId
+    config.mEventHandler = rtcEventHandler
+    rtcEngine = RtcEngine.create(config)
+    rtcAppId = normalizedAppId
+    emit('engineInitialized', { appId: normalizedAppId } as UTSJSONObject)
+    return 0
+  } catch (e) {
+    // 创建中途失败时可能已经分配了原生资源，先销毁再清空引用。
+    try {
+      RtcEngine.destroy()
+    } catch (destroyError) {
+      console.log(`[agora-rtc] destroy after create failure: ${destroyError}`)
+    }
+    rtcEngine = null
+    rtcAppId = ''
+    emit('error', { code: ENGINE_NOT_CREATED, message: e.toString() } as UTSJSONObject)
+    return ENGINE_NOT_CREATED
+  }
+}
+
+export function joinChannel(options: JoinChannelOptions): number {
+  const engine = rtcEngine
+  if (engine == null) return ENGINE_NOT_CREATED
+  if (options.channelName.trim().length == 0) return INVALID_ARGUMENT
+  if (options.uid < 0 || options.uid > 2147483647 || options.uid % 1 != 0) return INVALID_ARGUMENT
+
+  const publishAudio = options.publishAudio ?? true
+  const publishVideo = options.publishVideo ?? true
+  const autoSubscribeAudio = options.autoSubscribeAudio ?? true
+  const autoSubscribeVideo = options.autoSubscribeVideo ?? true
+
+  var result = Number.from(engine.setChannelProfile(Constants.CHANNEL_PROFILE_COMMUNICATION))
+  if (result != 0) return result
+  result = Number.from(engine.setClientRole(Constants.CLIENT_ROLE_BROADCASTER))
+  if (result != 0) return result
+  // 纯语音场景不启用视频模块，避免重新拉起摄像头和本地预览。
+  if (publishAudio || autoSubscribeAudio) {
+    result = Number.from(engine.enableAudio())
+    if (result != 0) return result
+  }
+  const encoderConfig = new VideoEncoderConfiguration()
+  encoderConfig.dimensions = new VideoDimensions(
+    (options.videoEncoderWidth ?? 960).toInt(),
+    (options.videoEncoderHeight ?? 540).toInt()
+  )
+  encoderConfig.frameRate = (options.videoEncoderFrameRate ?? 24).toInt()
+  encoderConfig.bitrate = VideoEncoderConfiguration.STANDARD_BITRATE
+  const orientationMode = options.videoOrientationMode ?? 'adaptive'
+  if (orientationMode == 'portrait') {
+    encoderConfig.orientationMode = ORIENTATION_MODE.ORIENTATION_MODE_FIXED_PORTRAIT
+  } else if (orientationMode == 'landscape') {
+    encoderConfig.orientationMode = ORIENTATION_MODE.ORIENTATION_MODE_FIXED_LANDSCAPE
+  } else {
+    encoderConfig.orientationMode = ORIENTATION_MODE.ORIENTATION_MODE_ADAPTIVE
+  }
+  result = Number.from(engine.setVideoEncoderConfiguration(encoderConfig))
+  if (result != 0) return result
+  if (publishVideo || autoSubscribeVideo) {
+    result = Number.from(engine.enableVideo())
+    if (result != 0) return result
+  }
+
+  const mediaOptions = new ChannelMediaOptions()
+  mediaOptions.publishMicrophoneTrack = publishAudio
+  mediaOptions.publishCameraTrack = publishVideo
+  mediaOptions.autoSubscribeAudio = autoSubscribeAudio
+  mediaOptions.autoSubscribeVideo = autoSubscribeVideo
+  mediaOptions.clientRoleType = Constants.CLIENT_ROLE_BROADCASTER
+  mediaOptions.channelProfile = Constants.CHANNEL_PROFILE_COMMUNICATION
+
+  const token = options.token ?? ''
+  return Number.from(engine.joinChannel(token.length > 0 ? token : null, options.channelName, options.uid.toInt(), mediaOptions))
+}
+
+export function leaveChannel(): number {
+  const engine = rtcEngine
+  return engine == null ? ENGINE_NOT_CREATED : Number.from(engine.leaveChannel())
+}
+
+export function startPreview(): number {
+  const engine = rtcEngine
+  return engine == null ? ENGINE_NOT_CREATED : Number.from(engine.startPreview())
+}
+
+export function stopPreview(): number {
+  const engine = rtcEngine
+  return engine == null ? ENGINE_NOT_CREATED : Number.from(engine.stopPreview())
+}
+
+export function enableLocalAudio(enabled: boolean): number {
+  const engine = rtcEngine
+  return engine == null ? ENGINE_NOT_CREATED : Number.from(engine.enableLocalAudio(enabled))
+}
+
+export function enableLocalVideo(enabled: boolean): number {
+  const engine = rtcEngine
+  return engine == null ? ENGINE_NOT_CREATED : Number.from(engine.enableLocalVideo(enabled))
+}
+
+/** 只停止发送本地音频，保留麦克风采集和音频会话；关闭麦克风请用 enableLocalAudio(false)。 */
+export function muteLocalAudioStream(muted: boolean): number {
+  const engine = rtcEngine
+  return engine == null ? ENGINE_NOT_CREATED : Number.from(engine.muteLocalAudioStream(muted))
+}
+
+/** 只停止发送本地视频，保留摄像头采集；关闭摄像头请用 enableLocalVideo(false)。 */
+export function muteLocalVideoStream(muted: boolean): number {
+  const engine = rtcEngine
+  return engine == null ? ENGINE_NOT_CREATED : Number.from(engine.muteLocalVideoStream(muted))
+}
+
+export function switchCamera(): number {
+  const engine = rtcEngine
+  return engine == null ? ENGINE_NOT_CREATED : Number.from(engine.switchCamera())
+}
+
+/** true 使用扬声器，false 使用听筒；连接外部音频设备时以系统最终路由为准。 */
+export function setEnableSpeakerphone(enabled: boolean): number {
+  const engine = rtcEngine
+  return engine == null ? ENGINE_NOT_CREATED : Number.from(engine.setEnableSpeakerphone(enabled))
+}
+
+/** uid=0 绑定本地预览，uid>0 绑定远端用户。renderMode 支持 hidden/fit。 */
+export function setupVideoView(view: View, uid: number, renderMode: string): number {
+  const engine = rtcEngine
+  if (engine == null) return ENGINE_NOT_CREATED
+  if (uid < 0 || uid > 2147483647 || uid % 1 != 0) return INVALID_ARGUMENT
+  if (renderMode != 'fit' && renderMode != 'hidden') return INVALID_ARGUMENT
+  const mode = renderMode == 'fit' ? Constants.RENDER_MODE_FIT : Constants.RENDER_MODE_HIDDEN
+  const canvas = new VideoCanvas(view, mode, uid.toInt())
+  return Number.from(uid == 0 ? engine.setupLocalVideo(canvas) : engine.setupRemoteVideo(canvas))
+}
+
+export function clearVideoView(uid: number): number {
+  const engine = rtcEngine
+  if (engine == null) return 0
+  if (uid < 0 || uid > 2147483647 || uid % 1 != 0) return INVALID_ARGUMENT
+  if (uid == 0) return Number.from(engine.setupLocalVideo(null))
+  const canvas = new VideoCanvas(null, Constants.RENDER_MODE_HIDDEN, uid.toInt())
+  return Number.from(engine.setupRemoteVideo(canvas))
+}
+
+export function destroyRtcEngine() {
+  rtcEventCallback = null
+  const engine = rtcEngine
+  if (engine != null) {
+    // 先退出频道再销毁，避免残留连接影响下一次入房。
+    try {
+      engine.leaveChannel()
+    } catch (leaveError) {
+      console.log(`[agora-rtc] leave before destroy: ${leaveError}`)
+    }
+  }
+  rtcEngine = null
+  rtcAppId = ''
+  RtcEngine.destroy()
+}

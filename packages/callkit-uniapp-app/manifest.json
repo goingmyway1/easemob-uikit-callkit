@@ -1,0 +1,54 @@
+{
+    "name" : "easemob-callkit-uniapp-app-demo",
+    "appid" : "__UNI__9A97F59",
+    "description" : "环信 CallKit UniApp App 示例（agora-rtc 原生 UI）",
+    "versionName" : "0.1.0",
+    "versionCode" : 100,
+    "transformPx" : false,
+    "app-plus" : {
+        "usingComponents" : true,
+        "nvueStyleCompiler" : "uni-app",
+        "compilerVersion" : 3,
+        "statusbar" : {
+            "immersed" : true,
+            "style" : "dark",
+            "background" : "#f5f6fa"
+        },
+        "splashscreen" : {
+            "alwaysShowBeforeRender" : true,
+            "waiting" : true,
+            "autoclose" : true,
+            "delay" : 0
+        },
+        "modules" : {
+            "Camera" : {},
+            "Microphone" : {}
+        },
+        "distribute" : {
+            "android" : {
+                "permissions" : [
+                    "<uses-permission android:name=\"android.permission.CAMERA\"/>",
+                    "<uses-permission android:name=\"android.permission.RECORD_AUDIO\"/>",
+                    "<uses-permission android:name=\"android.permission.MODIFY_AUDIO_SETTINGS\"/>",
+                    "<uses-permission android:name=\"android.permission.ACCESS_NETWORK_STATE\"/>",
+                    "<uses-permission android:name=\"android.permission.ACCESS_WIFI_STATE\"/>",
+                    "<uses-permission android:name=\"android.permission.INTERNET\"/>",
+                    "<uses-permission android:name=\"android.permission.WAKE_LOCK\"/>"
+                ]
+            },
+            "ios" : {
+                "privacyDescription" : {
+                    "NSCameraUsageDescription" : "视频通话需要使用摄像头",
+                    "NSMicrophoneUsageDescription" : "语音/视频通话需要使用麦克风"
+                },
+                "dSYMs" : false
+            },
+            "sdkConfigs" : {}
+        }
+    },
+    "quickapp" : {},
+    "uniStatistics" : {
+        "enable" : false
+    },
+    "vueVersion" : "3"
+}

@@ -1,0 +1,1683 @@
+<template>
+	<view class="call" :style="rootStyle">
+		<!--
+			视频舞台：原生视频视图常驻，不随摄像头开关或远端 STOPPED 卸载。
+			Android 上卸载/重建原生视图会让 Canvas 丢失，表现为恢复后只剩控件边框、没有画面；
+			摄像头关闭时改用占位层覆盖最后一帧。
+		-->
+		<view v-if="isVideo" class="stage" :style="stageStyle">
+			<agora-video-view ref="mainVideo" :uid="mainUid" renderMode="hidden" renderType="texture"
+				:style="stageStyle" @bind-error="reportVideoBindError" />
+			<view v-if="!mainVideoOn" class="placeholder" :style="[stageStyle, placeholderStyle]">
+				<slot v-if="mainUid === 0" name="local-placeholder" :uid="localUid" :muted="videoMuted">
+					<view class="avatar-circle">
+						<agora-call-icon name="user" :size="46" />
+					</view>
+					<text class="placeholder-text" :style="mutedTextStyle">本地摄像头已关闭</text>
+				</slot>
+				<slot v-else name="remote-placeholder" :uid="remoteUid" :video-off="remoteVideoOff">
+					<view class="avatar-circle">
+						<agora-call-icon name="user" :size="46" />
+					</view>
+					<text class="placeholder-text" :style="mutedTextStyle">对方摄像头已关闭</text>
+				</slot>
+			</view>
+
+			<!-- 视频舞台点击层：只负责切换 chrome，不挡住小窗和控件。 -->
+			<view v-if="isVideo && !callingVisible" class="stage-tap" @click="onStageTap" />
+
+			<view v-if="remoteUid" class="small-window" :style="smallWindowStyle">
+				<agora-video-view ref="smallVideo" :uid="smallUid" renderMode="hidden" renderType="texture"
+					:cornerRadius="10" :style="smallVideoStyle" @bind-error="reportVideoBindError" />
+				<view v-if="!smallVideoOn" class="placeholder small-placeholder" :style="[smallVideoStyle, placeholderStyle]">
+					<text class="placeholder-text" :style="mutedTextStyle">摄像头已关闭</text>
+				</view>
+				<!-- 原生视频可能消费触摸事件，透明手势层统一处理拖动和点击交换。 -->
+				<view class="small-window-gesture" @touchstart="onSmallWindowTouchStart"
+					@touchmove="onSmallWindowTouchMove" @touchend="onSmallWindowTouchEnd"
+					@touchcancel="onSmallWindowTouchEnd" @click="switchWindows"></view>
+			</view>
+
+			<slot v-if="mainUid === 0" name="local-overlay" :uid="localUid" :audio-muted="audioMuted"
+				:video-muted="videoMuted" />
+			<slot v-else name="remote-overlay" :uid="remoteUid" :audio-muted="remoteAudioMuted"
+				:video-off="remoteVideoOff" />
+		</view>
+
+		<!-- 语音舞台：圆形头像 + 名称 + 通话时长；呼叫页显示时让位给呼叫页 -->
+		<view v-else-if="!callingVisible" class="audio-stage" :style="audioStageStyle">
+			<view class="audio-avatar" :style="placeholderStyle">
+				<slot name="remote-placeholder" :uid="remoteUid" :video-off="true">
+					<agora-call-icon name="user" :size="54" />
+				</slot>
+			</view>
+			<text class="audio-name" :style="textStyle">{{ audioName }}</text>
+			<text v-if="audioMeta" class="audio-meta" :style="mutedTextStyle">{{ audioMeta }}</text>
+			<text v-if="remoteUid && remoteAudioMuted" class="audio-hint" :style="mutedTextStyle">对方麦克风已关闭</text>
+			<slot name="remote-overlay" :uid="remoteUid" :audio-muted="remoteAudioMuted" :video-off="remoteVideoOff" />
+		</view>
+
+		<!--
+			呼叫页：入房后、远端加入前展示被叫头像、姓名和 loading。
+			只消费业务传入的展示数据，不包含邀请、振铃、接听/拒接等信令逻辑。
+		-->
+		<view v-if="callingVisible" class="calling-overlay" :style="callingOverlayStyle">
+			<slot name="calling" :name="callingName" :avatar="callingAvatar" :state="callState">
+				<slot name="calling-background" :avatar="callingAvatar">
+					<image v-if="callingBackground" class="calling-background" :src="callingBackground"
+						mode="aspectFill" />
+				</slot>
+				<view class="calling-scrim" :style="callingScrimStyle" />
+				<view class="calling-content" :style="callingContentStyle">
+					<slot name="calling-avatar" :name="callingName" :avatar="callingAvatar">
+						<view class="calling-avatar" :style="callingAvatarStyle">
+							<image v-if="callingAvatar && !callingAvatarFailed" class="calling-avatar-image"
+								:src="callingAvatar" mode="aspectFill" @error="callingAvatarFailed = true" />
+							<agora-call-icon v-else name="user" :size="52" />
+						</view>
+					</slot>
+					<slot name="calling-name" :name="callingName">
+						<text class="calling-name" :style="callingNameStyle">{{ callingName }}</text>
+					</slot>
+					<text v-if="callingStatusText" class="calling-text" :style="callingTextStyle">{{ callingStatusText }}</text>
+					<slot name="calling-loading" :phase="callingDotPhase">
+						<view v-if="showCallingLoading" class="calling-dots">
+							<view v-for="index in 3" :key="index" class="calling-dot"
+								:style="callingDotStyle(index - 1)" />
+						</view>
+					</slot>
+				</view>
+			</slot>
+		</view>
+
+		<!-- 顶部栏：默认只显示标题；收起、邀请等业务动作请用 header 插槽接入 -->
+		<view v-if="showHeader && chromeShown" class="top-bar" :style="headerContainerStyle" @click="handleChromeInteraction">
+			<slot name="header" :title="title || defaultTitle" :state="callState" :calling="callingVisible">
+				<text v-if="title && isVideo && !callingVisible && !durationVisible" class="top-title" :style="mutedTextStyle">{{ title }}</text>
+			</slot>
+			<text v-if="durationVisible" class="top-duration" :style="[textStyle, durationStyle]">{{ durationText }}</text>
+		</view>
+
+		<!-- 状态提示只在入房、等待、重连和错误时出现，正常通话不遮挡画面 -->
+		<view v-if="showStatus && !callingVisible" class="status-panel" :style="{ top: statusTop + 'px' }">
+			<slot v-if="isPermissionError" name="permission-denied" :error="lastError" :state="callState">
+				<text class="status-text" :style="errorTextStyle">{{ statusText }}</text>
+			</slot>
+			<slot v-else-if="lastError" name="error" :error="lastError" :state="callState">
+				<text class="status-text" :style="errorTextStyle">{{ statusText }}</text>
+			</slot>
+			<slot v-else-if="joining" name="loading" :state="callState">
+				<text class="status-text" :style="statusTextStyle">{{ statusText }}</text>
+			</slot>
+			<slot v-else-if="joined && !remoteUid" name="waiting" :state="callState">
+				<text class="status-text" :style="statusTextStyle">等待对方加入</text>
+			</slot>
+			<slot v-else name="status" :state="callState" :status-text="statusText">
+				<text class="status-text" :style="statusTextStyle">{{ statusText }}</text>
+			</slot>
+			<view v-if="canJoin && (!autoJoin || lastError)" class="join-button" :style="accentStyle"
+				@click="startJoin"><text class="join-button-text" :style="textStyle">{{ lastError ? '重试' : '加入通话' }}</text></view>
+		</view>
+
+		<!-- 控制栏：视频第一行 麦克风/摄像头/扬声器；操作行挂断居中，视频右侧为翻转摄像头，语音两侧为麦克风与扬声器 -->
+		<view v-if="chromeShown" class="controls" :style="controlsStyle" @click="handleChromeInteraction">
+			<slot v-if="showControls" name="controls" :audio-muted="audioMuted" :video-muted="videoMuted"
+				:speaker-enabled="speakerphoneEnabled" :joined="joined" :calling="callingVisible">
+				<!-- 视频：第一行 麦克风 / 摄像头 / 扬声器 -->
+				<view v-if="isVideo" class="control-row">
+					<view class="control-item" :style="controlItemStyle">
+						<view class="control-button" :style="audioMuted ? controlOffStyle : controlStyle" @click="toggleAudio">
+							<slot name="audio-icon" :muted="audioMuted"><agora-call-icon
+									:name="audioMuted ? 'microphone-off' : 'microphone'" :size="26" /></slot>
+						</view>
+						<text class="control-label" :style="textStyle">麦克风</text>
+						<text class="control-state" :style="mutedTextStyle">{{ audioMuted ? '已关闭' : '已开启' }}</text>
+					</view>
+					<view class="control-item" :style="controlItemStyle">
+						<view class="control-button" :style="videoMuted ? controlOffStyle : controlStyle" @click="toggleVideo">
+							<slot name="video-icon" :muted="videoMuted"><agora-call-icon
+									:name="videoMuted ? 'video-off' : 'video'" :size="26" /></slot>
+						</view>
+						<text class="control-label" :style="textStyle">摄像头</text>
+						<text class="control-state" :style="mutedTextStyle">{{ videoMuted ? '已关闭' : '已开启' }}</text>
+					</view>
+					<view class="control-item" :style="controlItemStyle">
+						<view class="control-button" :style="speakerphoneEnabled ? controlStyle : controlOffStyle" @click="toggleSpeaker">
+							<slot name="speaker-icon" :enabled="speakerphoneEnabled"><agora-call-icon
+									:name="speakerphoneEnabled ? 'speaker' : 'earpiece'" :size="26" /></slot>
+						</view>
+						<text class="control-label" :style="textStyle">扬声器</text>
+						<text class="control-state" :style="mutedTextStyle">{{ speakerphoneEnabled ? '已开启' : '已关闭' }}</text>
+					</view>
+				</view>
+				<!-- 操作行：挂断居中；视频右侧为翻转摄像头，语音左右为麦克风/扬声器 -->
+				<view class="action-row">
+					<view v-if="isVideo" class="control-item" :style="controlItemStyle"></view>
+					<view v-else class="control-item" :style="controlItemStyle">
+						<view class="control-button" :style="audioMuted ? controlOffStyle : controlStyle" @click="toggleAudio">
+							<slot name="audio-icon" :muted="audioMuted"><agora-call-icon
+									:name="audioMuted ? 'microphone-off' : 'microphone'" :size="26" /></slot>
+						</view>
+						<text class="control-label" :style="textStyle">麦克风</text>
+						<text class="control-state" :style="mutedTextStyle">{{ audioMuted ? '已关闭' : '已开启' }}</text>
+					</view>
+
+					<view class="control-item" :style="controlItemStyle">
+						<view class="hangup-button" :style="dangerStyle" @click="endCall">
+							<slot name="hangup-icon"><agora-call-icon name="hangup" :size="34" /></slot>
+						</view>
+						<text class="hangup-label" :style="textStyle">{{ hangupLabel }}</text>
+					</view>
+
+					<view v-if="isVideo" class="control-item" :style="controlItemStyle">
+						<view class="control-button" :style="controlStyle" @click="flipCamera">
+							<slot name="camera-icon"><agora-call-icon name="camera-switch" :size="26" /></slot>
+						</view>
+						<text class="control-label" :style="textStyle">翻转摄像头</text>
+					</view>
+					<view v-else class="control-item" :style="controlItemStyle">
+						<view class="control-button" :style="speakerphoneEnabled ? controlStyle : controlOffStyle" @click="toggleSpeaker">
+							<slot name="speaker-icon" :enabled="speakerphoneEnabled"><agora-call-icon
+									:name="speakerphoneEnabled ? 'speaker' : 'earpiece'" :size="26" /></slot>
+						</view>
+						<text class="control-label" :style="textStyle">扬声器</text>
+						<text class="control-state" :style="mutedTextStyle">{{ speakerphoneEnabled ? '已开启' : '已关闭' }}</text>
+					</view>
+				</view>
+			</slot>
+			<slot name="control-extra" />
+		</view>
+		<slot name="footer" />
+	</view>
+</template>
+
+<script>
+	import callComponent, { CALL_UI_STATE } from '../../mixins/call-component.js'
+	import AgoraCallIcon from '../agora-call-icon/agora-call-icon.nvue'
+	import {
+		RTC_CONNECTION_STATE,
+		REMOTE_MEDIA_STATE,
+		rtcLogger
+	} from '../../index.js'
+
+	// 原生 ref 与原生布局都可能晚于 $nextTick 就绪；按帧有限次重试，避免恢复摄像头后停在黑屏。
+	const VIDEO_BIND_RETRY_DELAY_MS = 80
+	const VIDEO_BIND_MAX_ATTEMPTS = 6
+
+	// 小窗尺寸与主/小窗交换逻辑绑定，手势层必须与之保持一致。
+	const SMALL_WINDOW_WIDTH = 100
+	const SMALL_WINDOW_HEIGHT = 140
+	const SMALL_WINDOW_MARGIN = 16
+
+	const SMALL_WINDOW_CORNER_RADIUS = 10
+
+	// 临时开关：false 时小窗固定不可拖动，但仍保留点击交换主/小窗。
+	const SMALL_WINDOW_DRAGGABLE = false
+
+	// 插件内置铃音；宿主可通过 outgoingRingtone / incomingRingtone 覆盖。
+	const DEFAULT_OUTGOING_RINGTONE = '/uni_modules/agora-rtc/static/ringtones/outgoing.mp3'
+	const DEFAULT_INCOMING_RINGTONE = '/uni_modules/agora-rtc/static/ringtones/incoming.mp3'
+
+	/**
+	 * 一对一默认皮肤。
+	 * 仅跟踪第一个远端 UID；主/小窗只交换绑定 UID，不交换两个原生容器的尺寸和位置。
+	 * 生命周期、状态机、入房与设备控制来自 call-component mixin。
+	 */
+	export default {
+		name: 'AgoraCallOneToOne',
+		components: { AgoraCallIcon },
+		mixins: [callComponent],
+		props: {
+			/** 被叫显示名；仅用于展示，不由 RTC 提供。 */
+			remoteName: {
+				type: String,
+				default: ''
+			},
+			/** 被叫头像 URL；为空或加载失败时回退到内置用户图标。 */
+			remoteAvatar: {
+				type: String,
+				default: ''
+			},
+			/** 是否在入房后、远端加入前展示呼叫页。 */
+			showCalling: {
+				type: Boolean,
+				default: true
+			},
+			/** 是否显示呼叫页三点 loading。 */
+			showCallingLoading: {
+				type: Boolean,
+				default: true
+			},
+			/** 姓名下方的可选文案，例如“正在呼叫…”。 */
+			callingText: {
+				type: String,
+				default: ''
+			},
+			/** 呼叫页背景图；音频建议传入预模糊图。 */
+			callingBackground: {
+				type: String,
+				default: ''
+			},
+			/** 呼叫页挂断按钮文案。 */
+			callingHangupText: {
+				type: String,
+				default: '取消'
+			},
+			/** 主叫振铃；为空使用插件内置 outgoing.mp3。 */
+			outgoingRingtone: {
+				type: String,
+				default: ''
+			},
+			/** 被叫振铃；为空使用插件内置 incoming.mp3。 */
+			incomingRingtone: {
+				type: String,
+				default: ''
+			},
+			/** 铃音总开关。 */
+			ringtoneEnabled: {
+				type: Boolean,
+				default: true
+			},
+			/** 铃音音量，0～1。 */
+			ringtoneVolume: {
+				type: Number,
+				default: 1
+			},
+			/** 是否循环播放。 */
+			ringtoneLoop: {
+				type: Boolean,
+				default: true
+			},
+			/** iOS 是否遵循静音开关；默认遵循。 */
+			ringtoneObeyMuteSwitch: {
+				type: Boolean,
+				default: true
+			},
+			/** 呼叫方向，决定默认播放哪支铃音。 */
+			callDirection: {
+				type: String,
+				default: 'outgoing'
+			},
+			/** 入局振铃状态；由宿主信令控制，插件不自行推断来电。 */
+			ringing: {
+				type: Boolean,
+				default: false
+			},
+			/** 是否显示通话时长。 */
+			showDuration: {
+				type: Boolean,
+				default: true
+			},
+			/** 时长位置：顶部居中或几何居中。 */
+			durationPlacement: {
+				type: String,
+				default: 'top'
+			},
+			/** 计时起点：远端加入或本地入房。 */
+			durationStart: {
+				type: String,
+				default: 'remote-joined'
+			},
+			/** 视频通话是否自动隐藏顶部/底部 chrome。 */
+			chromeAutoHide: {
+				type: Boolean,
+				default: true
+			},
+			/** 视频通话自动隐藏延迟，毫秒。 */
+			chromeAutoHideDelay: {
+				type: Number,
+				default: 10000
+			},
+			/** 音视频通话是否保持屏幕常亮。 */
+			keepScreenOn: {
+				type: Boolean,
+				default: true
+			}
+		},
+		created() {
+			// 记录每个窗口实际绑定的原生视图实例与 UID；非响应式，原生实例不能放进 data。
+			this.videoBindings = {
+				main: { view: null, uid: null, ready: false },
+				small: { view: null, uid: null, ready: false }
+			}
+			this.videoBindRetryTimer = null
+			this.smallWindowNativeDrag = false
+			this.smallWindowNativeDragView = null
+			this.callingDotTimer = null
+			this.ringtoneContext = null
+			this.ringtoneActiveSource = ''
+			this.ringtoneKind = ''
+			this.ringtonePlaying = false
+			this.ringtoneFallbackDone = false
+			this.chromeAutoHideTimer = null
+			this.appShowHandler = null
+			this.appHideHandler = null
+			this.appHidden = false
+		},
+		data() {
+			return {
+				remoteUid: 0,
+				remoteVideoOff: false,
+				remoteAudioMuted: false,
+				remoteJoinedOnce: false,
+				// 呼叫页 loading 点当前高亮位置（0～2），由定时器驱动。
+				callingDotPhase: 0,
+				callingAvatarFailed: false,
+				primaryView: 'remote',
+				smallWindowPosition: null,
+				durationSeconds: 0,
+				chromeVisible: true,
+				durationStartedAt: 0,
+				keepScreenOnActive: false
+			}
+		},
+		computed: {
+			defaultTitle() {
+				return this.isVideo ? '一对一音视频通话' : '一对一语音通话'
+			},
+			headerHeight() {
+				return this.safeAreaTop + 56
+			},
+			headerContainerStyle() {
+				return {
+					...this.headerStyle,
+					paddingTop: this.safeAreaTop + 'px',
+					height: this.headerHeight + 'px'
+				}
+			},
+			statusTop() {
+				return this.headerHeight + 6
+			},
+			stageStyle() {
+				return {
+					width: this.windowWidth + 'px',
+					height: this.windowHeight + 'px'
+				}
+			},
+			controlItemWidth() {
+				return Math.floor((this.windowWidth - 32) / 3)
+			},
+			controlItemStyle() {
+				return {
+					width: this.controlItemWidth + 'px'
+				}
+			},
+			controlsStyle() {
+				return {
+					paddingBottom: (this.safeAreaBottom + 22) + 'px'
+				}
+			},
+			audioStageStyle() {
+				// 让头像组落在控制栏上方的视觉中心，与设计稿一致。
+				return {
+					paddingBottom: (this.safeAreaBottom + 330) + 'px'
+				}
+			},
+			audioName() {
+				if (this.remoteName) return this.remoteName
+				if (this.title) return this.title
+				return this.remoteUid ? '远端用户' : '等待对方加入'
+			},
+			audioMeta() {
+				if (this.joined && this.remoteUid > 0) return ''
+				if (this.joined) return this.showDuration ? this.durationText : this.statusText
+				return this.statusText
+			},
+			durationText() {
+				const total = Math.max(0, Math.floor(this.durationSeconds))
+				const hours = Math.floor(total / 3600)
+				const minutes = Math.floor((total % 3600) / 60)
+				const seconds = total % 60
+				const mm = String(minutes).padStart(2, '0')
+				const ss = String(seconds).padStart(2, '0')
+				return hours > 0 ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`
+			},
+			chromeShown() {
+				return !this.isVideo || this.chromeVisible
+			},
+			durationVisible() {
+				return this.showDuration && this.remoteUid > 0 && !this.callingVisible
+			},
+			durationStyle() {
+				if (this.durationPlacement === 'center') return {
+					top: Math.round(this.windowHeight * 0.45) + 'px'
+				}
+				return {
+					top: (this.safeAreaTop + 18) + 'px'
+				}
+			},
+			canToggleChrome() {
+				return this.isVideo && this.joined && !this.callingVisible && !this.lastError && !this.reconnecting &&
+					this.remoteUid > 0
+			},
+			callingVisible() {
+				if (!this.showCalling || this.remoteUid || this.remoteJoinedOnce) return false
+				if (this.lastError || this.reconnecting) return false
+				if (this.callState === CALL_UI_STATE.FAILED || this.callState === CALL_UI_STATE.LEAVING || this.callState ===
+					CALL_UI_STATE.DISPOSED) return false
+				// 入局邀请：宿主置 ringing=true 时即使尚未入房也展示呼叫页。
+				if (this.callDirection === 'incoming' && this.ringing) return true
+				return this.joining || this.joined
+			},
+			callingName() {
+				return this.remoteName || '对方'
+			},
+			callingAvatar() {
+				return this.remoteAvatar || ''
+			},
+			callingOverlayStyle() {
+				return {
+					// 视频背景是本地预览，保持透明；音频没有原生画面，使用主题背景色。
+					backgroundColor: this.isVideo ? 'transparent' : (this.theme.callingBackgroundColor || '#0b0b0f')
+				}
+			},
+			callingScrimStyle() {
+				return {
+					backgroundColor: this.theme.callingScrimColor || (this.isVideo ? 'rgba(0, 0, 0, 0.18)' :
+						'rgba(0, 0, 0, 0.35)')
+				}
+			},
+			callingContentStyle() {
+				// 给底部控制栏留出空间，让头像落在屏幕上三分之一附近。
+				return {
+					paddingBottom: (this.safeAreaBottom + (this.isVideo ? 300 : 330)) + 'px'
+				}
+			},
+			callingAvatarStyle() {
+				return {
+					backgroundColor: this.theme.callingAvatarBackgroundColor || 'rgba(255, 255, 255, 0.12)'
+				}
+			},
+			callingNameStyle() {
+				return {
+					color: this.theme.callingNameColor || this.theme.textColor || '#ffffff'
+				}
+			},
+			callingTextStyle() {
+				return {
+					color: this.theme.mutedTextColor || 'rgba(255, 255, 255, 0.72)'
+				}
+			},
+			callingStatusText() {
+				if (!this.callingText) return ''
+				// 支持“正在呼叫 {name}”这类模板，同时保留传入完整文案的能力。
+				return String(this.callingText).replace(/\{name\}/g, this.callingName)
+			},
+			hangupLabel() {
+				return this.callingVisible ? (this.callingHangupText || '取消') : '挂断'
+			},
+			outgoingCalling() {
+				if (this.callDirection !== 'outgoing') return false
+				if (this.lastError || this.reconnecting) return false
+				if (this.remoteUid || this.remoteJoinedOnce) return false
+				return this.callState === CALL_UI_STATE.JOINING || this.callState === CALL_UI_STATE.JOINED
+			},
+			ringtoneSource() {
+				if (!this.ringtoneEnabled || this.disposed || this.lastError || this.reconnecting) return ''
+				if (this.callState === CALL_UI_STATE.FAILED || this.callState === CALL_UI_STATE.LEAVING || this.callState ===
+					CALL_UI_STATE.DISPOSED) return ''
+				if (this.callDirection === 'incoming') {
+					// 入局铃音只由宿主 ringing 驱动；开始入房/接听后立即停铃。
+					if (!this.ringing || this.remoteUid) return ''
+					if (this.joining || this.joined) return ''
+					return this.incomingRingtone || DEFAULT_INCOMING_RINGTONE
+				}
+				if (!this.outgoingCalling) return ''
+				return this.outgoingRingtone || DEFAULT_OUTGOING_RINGTONE
+			},
+			normalizedRingtoneVolume() {
+				const value = Number(this.ringtoneVolume)
+				if (!Number.isFinite(value)) return 1
+				return Math.min(1, Math.max(0, value))
+			},
+			showStatus() {
+				if (this.isPermissionError || this.lastError) return true
+				if (this.joining || this.reconnecting) return true
+				if (this.joined && !this.remoteUid) return true
+				return this.canJoin && (!this.autoJoin || Boolean(this.lastError))
+			},
+			smallWindowX() {
+				const requested = this.smallWindowPosition ? Number(this.smallWindowPosition.x) :
+					this.windowWidth - SMALL_WINDOW_WIDTH - SMALL_WINDOW_MARGIN
+				return this.clampSmallWindowX(requested)
+			},
+			smallWindowY() {
+				const requested = this.smallWindowPosition ? Number(this.smallWindowPosition.y) :
+					this.headerHeight + 6
+				return this.clampSmallWindowY(requested)
+			},
+			smallWindowStyle() {
+				return {
+					// 拖动中原生 translation 负责跟手，布局位置保持起点；
+					// touchend 提交最终 left/top 后清零 translation，避免双重偏移。
+					left: this.smallWindowX + 'px',
+					top: this.smallWindowY + 'px',
+					width: SMALL_WINDOW_WIDTH + 'px',
+					height: SMALL_WINDOW_HEIGHT + 'px'
+				}
+			},
+			smallVideoStyle() {
+				return {
+					width: SMALL_WINDOW_WIDTH + 'px',
+					height: SMALL_WINDOW_HEIGHT + 'px',
+					borderRadius: SMALL_WINDOW_CORNER_RADIUS + 'px'
+				}
+			},
+			mainUid() {
+				return this.remoteUid && this.primaryView === 'remote' ? this.remoteUid : 0
+			},
+			smallUid() {
+				return this.remoteUid && this.primaryView === 'local' ? this.remoteUid : 0
+			},
+			/** 主窗画面是否应当可见；关闭摄像头时只叠加占位，不卸载原生视图。 */
+			mainVideoOn() {
+				return this.mainUid === 0 ? !this.videoMuted : !this.remoteVideoOff
+			},
+			smallVideoOn() {
+				return this.smallUid === 0 ? !this.videoMuted : !this.remoteVideoOff
+			}
+		},
+		watch: {
+			callingVisible(value) {
+				if (value) this.startCallingDotTimer()
+				else this.stopCallingDotTimer()
+			},
+			remoteAvatar() {
+				this.callingAvatarFailed = false
+			},
+			ringtoneSource(value) {
+				this.syncRingtone(value)
+			},
+			ringtoneVolume() {
+				this.applyRingtoneOptions()
+			},
+			ringtoneLoop(value) {
+				this.applyRingtoneOptions()
+				if (value && this.ringtoneSource && !this.ringtonePlaying) this.syncRingtone(this.ringtoneSource)
+			},
+			ringtoneObeyMuteSwitch() {
+				this.applyRingtoneOptions()
+			},
+			lastError(value) {
+				if (value) this.showChrome('force')
+			},
+			reconnecting(value) {
+				if (value) this.showChrome('force')
+				else if (this.joined) this.scheduleChromeAutoHide()
+			},
+			remoteUid(value) {
+				if (value > 0) {
+					this.showChrome('force')
+					this.scheduleChromeAutoHide()
+				} else {
+					this.stopChromeAutoHide()
+					this.showChrome('force')
+				}
+			},
+			keepScreenOn(value) {
+				if (value && this.joined) this.enableKeepScreenOn()
+				else if (!value) this.disableKeepScreenOn()
+			}
+		},
+		mounted() {
+			if (this.callingVisible) this.startCallingDotTimer()
+			this.syncRingtone(this.ringtoneSource)
+			this.registerAppHide()
+			this.registerAppShow()
+		},
+		beforeDestroy() {
+			this.unregisterAppShow()
+			this.unregisterAppHide()
+			this.stopChromeAutoHide()
+			this.disableKeepScreenOn()
+			this.destroyRingtone()
+		},
+		beforeUnmount() {
+			this.unregisterAppShow()
+			this.unregisterAppHide()
+			this.stopChromeAutoHide()
+			this.disableKeepScreenOn()
+			this.destroyRingtone()
+		},
+		methods: {
+			getVideoRef(ref) {
+				const value = this.$refs[ref]
+				return Array.isArray(value) ? value[0] : value
+			},
+			/** 窗口槽位对应的 ref 名与目标 UID；UID 0 表示本地预览。 */
+			slotRefName(slot) {
+				return slot === 'main' ? 'mainVideo' : 'smallVideo'
+			},
+			slotUid(slot) {
+				return Number(slot === 'main' ? this.mainUid : this.smallUid)
+			},
+			/** 当前展示本地预览的窗口槽位。 */
+			localSlot() {
+				return this.mainUid === 0 ? 'main' : 'small'
+			},
+			ensureVideoBindings() {
+				if (!this.videoBindings) {
+					this.videoBindings = {
+						main: { view: null, uid: null, ready: false },
+						small: { view: null, uid: null, ready: false }
+					}
+				}
+				return this.videoBindings
+			},
+			clearVideoBindRetry() {
+				if (!this.videoBindRetryTimer) return
+				clearTimeout(this.videoBindRetryTimer)
+				this.videoBindRetryTimer = null
+			},
+			/** 用记录的实例解绑：ref 已指向新实例时，旧 Canvas 仍需要被清理。 */
+			unbindVideoSlot(slot) {
+				if (slot === 'small') this.clearSmallWindowNativeTranslation()
+				const bindings = this.ensureVideoBindings()
+				const binding = bindings[slot]
+				bindings[slot] = { view: null, uid: null, ready: false }
+				if (!binding || !binding.view || typeof binding.view.unbindVideo !== 'function') return
+				const returnValue = binding.view.unbindVideo()
+				const result = returnValue === null || returnValue === undefined ? null : Number(returnValue)
+				this.logVideoViewApi('unbindVideo', this.slotRefName(slot), binding.uid, result)
+			},
+			/** 离开、远端离线和销毁均可重复调用；未绑定的窗口自动跳过。 */
+			unbindVideoWindows() {
+				this.clearVideoBindRetry()
+				this.unbindVideoSlot('main')
+				this.unbindVideoSlot('small')
+			},
+			bindVideoSlot(item) {
+				const view = item.view
+				if (!view || typeof view.bindVideo !== 'function') return
+				const returnValue = view.bindVideo(Number(item.uid))
+				const result = returnValue === null || returnValue === undefined ? null : Number(returnValue)
+				this.logVideoViewApi('bindVideo', item.ref, item.uid, result)
+				// 记录绑定事实：真实原生错误由 bind-error 上报，不靠反复解绑/绑定掩盖。
+				this.ensureVideoBindings()[item.slot] = {
+					view,
+					uid: Number(item.uid),
+					ready: view.viewReady === true
+				}
+			},
+			/**
+			 * 统一绑定主窗/小窗。
+			 *
+			 * 1. 原生视图常驻，关闭摄像头或远端 STOPPED 时不卸载，避免 Android 重建视图后丢失 Canvas；
+			 * 2. 只对“视图实例或 UID 变化”的窗口执行先统一解绑、再统一绑定，
+			 *    避免逐窗解绑清掉另一个窗口刚设置的新 Canvas；
+			 * 3. ref 或原生布局晚于 $nextTick 就绪时按帧有限次重试，恢复摄像头后不会停在黑屏。
+			 *
+			 * options.force：重连、回前台等场景原生 Surface 可能已重建，需要强制重绑。
+			 * options.slots：只处理指定窗口，本地视频恢复时不必扰动远端窗口。
+			 */
+			bindVideoWindows(options) {
+				const force = Boolean(options && options.force)
+				const attempt = Math.max(0, Number(options && options.attempt) || 0)
+				const scope = options && Array.isArray(options.slots) ? options.slots : ['main', 'small']
+				this.clearVideoBindRetry()
+				if (this.disposed || !this.isVideo) return
+				if (!this.session || !this.session.engineReady) return
+				this.$nextTick(() => {
+					if (this.disposed || !this.isVideo || !this.session.engineReady) return
+					const bindings = this.ensureVideoBindings()
+					const changed = []
+					let pending = false
+					scope.forEach((slot) => {
+						const ref = this.slotRefName(slot)
+						const uid = this.slotUid(slot)
+						const view = this.getVideoRef(ref)
+						if (!view) {
+							// 主窗常驻；小窗只在远端在线时存在，不存在不算未就绪。
+							if (slot === 'main' || this.remoteUid) pending = true
+							return
+						}
+						const binding = bindings[slot]
+						if (force || !binding || binding.view !== view || binding.uid !== uid) {
+							changed.push({ slot, ref, uid, view })
+							return
+						}
+						// viewReady=false 表示原生只排队未绑定，等组件在 NVLayouted 重放后确认。
+						if (binding.ready !== true) {
+							if (view.viewReady === true) binding.ready = true
+							else pending = true
+						}
+					})
+					if (changed.length > 0) {
+						changed.forEach((item) => this.unbindVideoSlot(item.slot))
+						changed.forEach((item) => this.bindVideoSlot(item))
+					}
+					if (pending && attempt < VIDEO_BIND_MAX_ATTEMPTS) {
+						this.videoBindRetryTimer = setTimeout(() => {
+							this.videoBindRetryTimer = null
+							this.bindVideoWindows({ force, slots: scope, attempt: attempt + 1 })
+						}, VIDEO_BIND_RETRY_DELAY_MS)
+					}
+				})
+			},
+			resolveRingtoneSource(source) {
+				if (!source) return ''
+				if (/^(https?:|file:|blob:|data:)/.test(source)) return source
+				// App 端把 /static、/uni_modules 等包内路径转成原生播放器可用的绝对文件路径。
+				if (typeof plus !== 'undefined' && plus.io && typeof plus.io.convertLocalFileSystemURL === 'function') {
+					try {
+						// 只把包内 /static、/uni_modules 路径映射到 _www；绝对原生路径保持原样。
+						const isPackagePath = source.indexOf('/static/') === 0 || source.indexOf('/uni_modules/') === 0
+						const normalized = isPackagePath ? '_www' + source : source
+						return plus.io.convertLocalFileSystemURL(normalized) || source
+					} catch (error) {
+						rtcLogger.warn('RINGTONE RESOLVE ERROR', error)
+					}
+				}
+				return source
+			},
+			ensureRingtoneContext() {
+				if (this.ringtoneContext) return this.ringtoneContext
+				if (typeof uni === 'undefined' || typeof uni.createInnerAudioContext !== 'function') {
+					rtcLogger.warn('RINGTONE UNAVAILABLE', {
+						reason: 'createInnerAudioContext missing'
+					})
+					return null
+				}
+				try {
+					const context = uni.createInnerAudioContext()
+					context.onError((error) => this.handleRingtoneError(error))
+					context.onPlay(() => rtcLogger.debug('RINGTONE STARTED', {
+						source: this.ringtoneActiveSource
+					}))
+					context.onStop(() => rtcLogger.debug('RINGTONE STOPPED', {
+						source: this.ringtoneActiveSource
+					}))
+					context.onEnded(() => {
+						// loop=false 时播放自然结束；loop=true 时通常不会触发。
+						this.ringtonePlaying = false
+						rtcLogger.debug('RINGTONE ENDED', {
+							source: this.ringtoneActiveSource
+						})
+					})
+					this.ringtoneContext = context
+					return context
+				} catch (error) {
+					rtcLogger.error('RINGTONE CREATE ERROR', error)
+					return null
+				}
+			},
+			applyRingtoneOptions() {
+				const context = this.ringtoneContext
+				if (!context) return
+				context.volume = this.normalizedRingtoneVolume
+				context.loop = Boolean(this.ringtoneLoop)
+				try {
+					context.obeyMuteSwitch = Boolean(this.ringtoneObeyMuteSwitch)
+				} catch (error) {
+					// 部分平台不支持该属性，设置失败不应阻断播放。
+					rtcLogger.warn('RINGTONE MUTE SWITCH UNSUPPORTED', error)
+				}
+			},
+			syncRingtone(source) {
+				if (this.disposed) {
+					this.destroyRingtone()
+					return
+				}
+				if (this.appHidden) return
+				if (!source) {
+					this.stopRingtone()
+					return
+				}
+				const kind = this.callDirection === 'incoming' ? 'incoming' : 'outgoing'
+				if (this.ringtoneActiveSource !== source) this.ringtoneFallbackDone = false
+				this.playRingtone(source, kind)
+			},
+			playRingtone(source, kind) {
+				const context = this.ensureRingtoneContext()
+				if (!context) {
+					this.ringtonePlaying = false
+					return
+				}
+				if (this.ringtoneActiveSource === source && this.ringtonePlaying) {
+					this.applyRingtoneOptions()
+					return
+				}
+				// 先清空 activeSource 再 stop，避免旧上下文补发的 error 触发错误回退。
+				this.ringtoneActiveSource = ''
+				try {
+					context.stop()
+				} catch (error) {
+					// 首次播放前 stop 可能提示“未播放”，忽略。
+				}
+				this.ringtoneActiveSource = source
+				this.ringtoneKind = kind
+				try {
+					this.applyRingtoneOptions()
+					const resolvedSource = this.resolveRingtoneSource(source)
+					context.src = resolvedSource
+					context.play()
+					this.ringtonePlaying = true
+					rtcLogger.debug('RINGTONE PLAY', {
+						kind,
+						source,
+						resolvedSource
+					})
+				} catch (error) {
+					this.ringtonePlaying = false
+					this.handleRingtoneError(error)
+				}
+			},
+			stopRingtone() {
+				this.ringtonePlaying = false
+				this.ringtoneActiveSource = ''
+				this.ringtoneFallbackDone = false
+				if (!this.ringtoneContext) return
+				try {
+					this.ringtoneContext.stop()
+				} catch (error) {
+					rtcLogger.warn('RINGTONE STOP ERROR', error)
+				}
+			},
+			destroyRingtone() {
+				this.stopRingtone()
+				if (!this.ringtoneContext) return
+				try {
+					this.ringtoneContext.destroy()
+				} catch (error) {
+					rtcLogger.warn('RINGTONE DESTROY ERROR', error)
+				}
+				this.ringtoneContext = null
+			},
+			handleRingtoneError(error) {
+				// stop() 后旧上下文可能补发 error，此时不再重播。
+				if (!this.ringtoneActiveSource) return
+				const kind = this.ringtoneKind || (this.callDirection === 'incoming' ? 'incoming' : 'outgoing')
+				const fallback = kind === 'incoming' ? DEFAULT_INCOMING_RINGTONE : DEFAULT_OUTGOING_RINGTONE
+				const source = this.ringtoneActiveSource
+				rtcLogger.warn('RINGTONE ERROR', {
+					kind,
+					source,
+					error
+				})
+				if (!this.ringtoneFallbackDone && source !== fallback) {
+					this.ringtoneFallbackDone = true
+					this.ringtoneActiveSource = ''
+					this.playRingtone(fallback, kind)
+					return
+				}
+				this.ringtonePlaying = false
+			},
+			startCallingDotTimer() {
+				this.stopCallingDotTimer()
+				if (this.disposed || this.appHidden || !this.callingVisible) return
+				this.callingDotPhase = 0
+				this.callingDotTimer = setInterval(() => {
+					this.callingDotPhase = (this.callingDotPhase + 1) % 3
+				}, 420)
+			},
+			stopCallingDotTimer() {
+				if (!this.callingDotTimer) return
+				clearInterval(this.callingDotTimer)
+				this.callingDotTimer = null
+			},
+			callingDotStyle(index) {
+				return {
+					backgroundColor: this.theme.callingLoadingColor || '#ffffff',
+					opacity: this.callingDotPhase === index ? 1 : 0.32
+				}
+			},
+			registerAppHide() {
+				if (typeof uni === 'undefined' || typeof uni.onAppHide !== 'function') return
+				this.appHideHandler = () => {
+					if (this.disposed) return
+					this.appHidden = true
+					this.stopRingtone()
+					this.stopCallingDotTimer()
+				}
+				uni.onAppHide(this.appHideHandler)
+			},
+			unregisterAppHide() {
+				if (this.appHideHandler && typeof uni !== 'undefined' && typeof uni.offAppHide === 'function') {
+					uni.offAppHide(this.appHideHandler)
+				}
+				this.appHideHandler = null
+			},
+			registerAppShow() {
+				if (typeof uni === 'undefined' || typeof uni.onAppShow !== 'function') return
+				this.appShowHandler = () => {
+					if (this.disposed) return
+					this.appHidden = false
+					this.syncRingtone(this.ringtoneSource)
+					if (this.callingVisible) this.startCallingDotTimer()
+					if (!this.joined) return
+					this.refreshDuration()
+					this.enableKeepScreenOn()
+					if (this.isVideo) this.scheduleChromeAutoHide()
+				}
+				uni.onAppShow(this.appShowHandler)
+			},
+			unregisterAppShow() {
+				if (this.appShowHandler && typeof uni !== 'undefined' && typeof uni.offAppShow === 'function') {
+					uni.offAppShow(this.appShowHandler)
+				}
+				this.appShowHandler = null
+			},
+			enableKeepScreenOn() {
+				if (!this.keepScreenOn || this.disposed) return
+				if (typeof uni === 'undefined' || typeof uni.setKeepScreenOn !== 'function') return
+				try {
+					uni.setKeepScreenOn({
+						keepScreenOn: true
+					})
+					this.keepScreenOnActive = true
+				} catch (error) {
+					rtcLogger.warn('KEEP SCREEN ON ERROR', error)
+				}
+			},
+			disableKeepScreenOn() {
+				if (!this.keepScreenOnActive) return
+				this.keepScreenOnActive = false
+				if (typeof uni === 'undefined' || typeof uni.setKeepScreenOn !== 'function') return
+				try {
+					uni.setKeepScreenOn({
+						keepScreenOn: false
+					})
+				} catch (error) {
+					rtcLogger.warn('KEEP SCREEN OFF ERROR', error)
+				}
+			},
+			scheduleChromeAutoHide() {
+				this.stopChromeAutoHide()
+				if (!this.isVideo || !this.chromeAutoHide || !this.chromeVisible) return
+				if (!this.joined || !this.remoteUid) return
+				if (this.callingVisible || this.lastError || this.reconnecting) return
+				const delay = Math.max(1000, Number(this.chromeAutoHideDelay) || 10000)
+				this.chromeAutoHideTimer = setTimeout(() => {
+					this.chromeAutoHideTimer = null
+					this.hideChrome('auto')
+				}, delay)
+			},
+			stopChromeAutoHide() {
+				if (!this.chromeAutoHideTimer) return
+				clearTimeout(this.chromeAutoHideTimer)
+				this.chromeAutoHideTimer = null
+			},
+			showChrome(reason = 'api') {
+				this.stopChromeAutoHide()
+				if (!this.chromeVisible) {
+					this.chromeVisible = true
+					this.$emit('chrome-visibility-change', {
+						visible: true,
+						reason
+					})
+				}
+				if (this.isVideo) this.scheduleChromeAutoHide()
+			},
+			hideChrome(reason = 'tap') {
+				if (!this.canToggleChrome) return
+				this.stopChromeAutoHide()
+				if (!this.chromeVisible) return
+				this.chromeVisible = false
+				this.$emit('chrome-visibility-change', {
+					visible: false,
+					reason
+				})
+			},
+			toggleChrome() {
+				if (!this.canToggleChrome) {
+					this.showChrome('force')
+					return
+				}
+				if (this.chromeVisible) this.hideChrome('tap')
+				else this.showChrome('tap')
+			},
+			handleChromeInteraction() {
+				if (!this.isVideo || !this.chromeVisible) return
+				this.scheduleChromeAutoHide()
+			},
+			onStageTap() {
+				this.toggleChrome()
+			},
+			startDurationTimer() {
+				this.stopDurationTimer()
+				this.durationStartedAt = Date.now()
+				this.durationSeconds = 0
+				this.durationTimer = setInterval(() => this.refreshDuration(), 1000)
+			},
+			refreshDuration() {
+				if (!this.durationStartedAt) return
+				this.durationSeconds = Math.max(0, Math.floor((Date.now() - this.durationStartedAt) / 1000))
+			},
+			stopDurationTimer() {
+				if (!this.durationTimer) return
+				clearInterval(this.durationTimer)
+				this.durationTimer = null
+			},
+			onCallJoined() {
+				this.remoteJoinedOnce = false
+				if (this.durationStart === 'local-joined') this.startDurationTimer()
+				this.bindVideoWindows()
+				this.enableKeepScreenOn()
+				this.showChrome('force')
+			},
+			onCallLeft() {
+				this.stopDurationTimer()
+				this.durationStartedAt = 0
+				this.durationSeconds = 0
+				this.remoteJoinedOnce = false
+				this.stopChromeAutoHide()
+				this.disableKeepScreenOn()
+				this.showChrome('force')
+				this.unbindVideoWindows()
+				this.remoteUid = 0
+				this.remoteVideoOff = false
+				this.remoteAudioMuted = false
+				this.primaryView = 'remote'
+			},
+			onRemoteUserJoined(data) {
+				const uid = Number(data.uid)
+				if (this.remoteUid && this.remoteUid !== uid) return
+				this.remoteUid = uid
+				this.remoteVideoOff = false
+				this.remoteAudioMuted = false
+				this.remoteJoinedOnce = true
+				this.primaryView = 'remote'
+				this.statusText = '正在通话'
+				if (this.durationStart === 'remote-joined') this.startDurationTimer()
+				this.showChrome('force')
+				this.scheduleChromeAutoHide()
+				this.bindVideoWindows()
+			},
+			/** 远端离线时只清理小窗，主窗回到本地预览，避免残留远端最后一帧。 */
+			onRemoteUserOffline(data) {
+				if (Number(data.uid) !== this.remoteUid) return
+				this.unbindVideoSlot('small')
+				this.remoteUid = 0
+				this.remoteVideoOff = false
+				this.remoteAudioMuted = false
+				this.primaryView = 'remote'
+				this.statusText = '等待对方加入'
+				this.stopDurationTimer()
+				this.durationStartedAt = 0
+				this.durationSeconds = 0
+				this.stopChromeAutoHide()
+				this.showChrome('force')
+				this.bindVideoWindows()
+			},
+			onRemoteVideoState(data) {
+				if (Number(data.uid) !== this.remoteUid) return
+				const state = Number(data.state)
+				if (state === REMOTE_MEDIA_STATE.STOPPED) {
+					// 只切换占位层，不卸载原生视图也不解绑 Canvas，避免恢复时重新绑定失败。
+					this.remoteVideoOff = true
+				}
+				if (state === REMOTE_MEDIA_STATE.STARTING || state === REMOTE_MEDIA_STATE.DECODING) {
+					this.remoteVideoOff = false
+					this.bindVideoWindows()
+				}
+			},
+			onRemoteAudioState(data) {
+				if (Number(data.uid) !== this.remoteUid) return
+				const state = Number(data.state)
+				if (state === REMOTE_MEDIA_STATE.STOPPED) this.remoteAudioMuted = true
+				if (state === REMOTE_MEDIA_STATE.STARTING || state === REMOTE_MEDIA_STATE.DECODING) this.remoteAudioMuted =
+					false
+			},
+			onConnectionFailure() {
+				// left 仍仅由真实 LEAVE_CHANNEL 在 Mixin 统一发出；失败与随后离房的清理保持幂等。
+				this.onCallLeft()
+			},
+			/** 重连成功后原生 Surface 可能已重建，强制重绑一次。 */
+			onConnectionStateChanged(data) {
+				if (Number(data.state) === RTC_CONNECTION_STATE.CONNECTED && this.joined) {
+					this.bindVideoWindows({ force: true })
+				}
+			},
+			/** App 回前台恢复预览后强制重绑，避免 Surface 销毁后黑屏。 */
+			onPreviewResumed() {
+				this.enableKeepScreenOn()
+				this.bindVideoWindows({ force: true })
+			},
+			onSmallWindowTouchStart(event) {
+				const touch = event && event.touches && event.touches[0]
+				if (!touch) return
+				if (!SMALL_WINDOW_DRAGGABLE) {
+					this.clearSmallWindowMoveTimer()
+					this.clearSmallWindowNativeTranslation()
+					this.smallWindowTouch = null
+					this.suppressSmallWindowClick = false
+					return
+				}
+				// 清理上一次可能残留的原生 translation，并探测双端原生拖动能力。
+				this.clearSmallWindowNativeTranslation()
+				const view = this.getSmallWindowView()
+				const nativeDrag = Boolean(view &&
+					typeof view.setDragTranslation === 'function' &&
+					typeof view.clearDragTranslation === 'function')
+				this.smallWindowNativeDrag = nativeDrag
+				this.smallWindowNativeDragView = nativeDrag ? view : null
+				if (nativeDrag) {
+					try {
+						view.setDragTranslation(0, 0)
+					} catch (error) {
+						rtcLogger.warn('SMALL WINDOW NATIVE DRAG ERROR', error)
+						this.smallWindowNativeDrag = false
+						this.smallWindowNativeDragView = null
+					}
+				}
+				this.smallWindowTouch = {
+					identifier: touch.identifier,
+					pageX: Number(touch.pageX),
+					pageY: Number(touch.pageY),
+					originX: this.smallWindowX,
+					originY: this.smallWindowY,
+					nextX: this.smallWindowX,
+					nextY: this.smallWindowY,
+					nativeDx: 0,
+					nativeDy: 0,
+					moved: false
+				}
+			},
+			onSmallWindowTouchMove(event) {
+				if (!SMALL_WINDOW_DRAGGABLE) return
+				const drag = this.smallWindowTouch
+				const touches = event && event.touches
+				if (!drag || !touches) return
+				let touch = touches[0]
+				for (let index = 0; index < touches.length; index += 1) {
+					if (touches[index].identifier === drag.identifier) {
+						touch = touches[index]
+						break
+					}
+				}
+				if (!touch) return
+				const deltaX = Number(touch.pageX) - drag.pageX
+				const deltaY = Number(touch.pageY) - drag.pageY
+				if (Math.abs(deltaX) > 3 || Math.abs(deltaY) > 3) drag.moved = true
+				drag.nextX = drag.originX + deltaX
+				drag.nextY = drag.originY + deltaY
+				this.scheduleSmallWindowMove()
+			},
+			/**
+			 * 每帧最多提交一次位置。
+			 * touchmove 在 Android 上可能高达 120～240Hz，逐次更新样式会让布局/绘制排队积压，
+			 * 小窗跟不上手指，表现为抖动；合并到一帧后位置与画面同步。
+			 */
+			/**
+			 * 每帧最多提交一次位置。
+			 * touchmove 在 Android 上可能高达 120～240Hz，逐次更新样式会让布局/绘制排队积压，
+			 * 小窗跟不上手指，表现为抖动；改为对齐绘制帧（rAF）并取整，避免原生视图与边框错位。
+			 */
+			scheduleSmallWindowMove() {
+				if (this.smallWindowMoveFrame || this.smallWindowMoveTimer) return
+				const flush = () => {
+					this.smallWindowMoveFrame = null
+					this.smallWindowMoveTimer = null
+					const drag = this.smallWindowTouch
+					if (!drag) return
+					if (this.smallWindowNativeDrag && this.smallWindowNativeDragView &&
+						this.applySmallWindowNativeDrag(drag.nextX, drag.nextY)) return
+					this.commitSmallWindowPosition(drag.nextX, drag.nextY)
+				}
+				// nvue（Weex）环境提供 requestAnimationFrame；缺失时退回到 16ms 定时器。
+				if (typeof requestAnimationFrame === 'function') {
+					this.smallWindowMoveFrame = requestAnimationFrame(flush)
+				} else {
+					this.smallWindowMoveTimer = setTimeout(flush, 16)
+				}
+			},
+			/** 取整后提交，跳过与上一帧相同的位置，减少无意义重绘。 */
+			commitSmallWindowPosition(x, y) {
+				const nextX = this.clampSmallWindowX(x)
+				const nextY = this.clampSmallWindowY(y)
+				const current = this.smallWindowPosition
+				if (current && current.x === nextX && current.y === nextY) return
+				this.smallWindowPosition = {
+					x: nextX,
+					y: nextY
+				}
+			},
+			getSmallWindowView() {
+				return this.getVideoRef('smallVideo')
+			},
+			clearSmallWindowNativeTranslation() {
+				const view = this.getSmallWindowView()
+				if (view && typeof view.clearDragTranslation === 'function') {
+					try {
+						view.clearDragTranslation()
+					} catch (error) {
+						rtcLogger.warn('SMALL WINDOW CLEAR TRANSLATION ERROR', error)
+					}
+				}
+				this.smallWindowNativeDrag = false
+				this.smallWindowNativeDragView = null
+			},
+			clampSmallWindowX(x) {
+				const requested = Number(x)
+				const value = Number.isFinite(requested) ? requested : 0
+				return Math.round(Math.max(0, Math.min(this.windowWidth - SMALL_WINDOW_WIDTH, value)))
+			},
+			clampSmallWindowY(y) {
+				const requested = Number(y)
+				const value = Number.isFinite(requested) ? requested : 0
+				return Math.round(Math.max(0, Math.min(this.windowHeight - SMALL_WINDOW_HEIGHT, value)))
+			},
+			/** 原生只做 translation，JS 继续处理触摸、边界和点击判定。 */
+			applySmallWindowNativeDrag(x, y) {
+				const view = this.smallWindowNativeDragView
+				const drag = this.smallWindowTouch
+				if (!view || !drag) return false
+				const dx = Math.round(this.clampSmallWindowX(x) - drag.originX)
+				const dy = Math.round(this.clampSmallWindowY(y) - drag.originY)
+				if (drag.nativeDx === dx && drag.nativeDy === dy) return true
+				drag.nativeDx = dx
+				drag.nativeDy = dy
+				try {
+					view.setDragTranslation(dx, dy)
+					return true
+				} catch (error) {
+					rtcLogger.warn('SMALL WINDOW NATIVE DRAG ERROR', error)
+					this.smallWindowNativeDrag = false
+					this.smallWindowNativeDragView = null
+					try {
+						view.clearDragTranslation()
+					} catch (clearError) {
+						// 原生方法已不可用，保持 fallback。
+					}
+					return false
+				}
+			},
+			clearSmallWindowMoveTimer() {
+				if (this.smallWindowMoveFrame) {
+					if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(this.smallWindowMoveFrame)
+					this.smallWindowMoveFrame = null
+				}
+				if (this.smallWindowMoveTimer) {
+					clearTimeout(this.smallWindowMoveTimer)
+					this.smallWindowMoveTimer = null
+				}
+			},
+			onSmallWindowTouchEnd() {
+				if (!SMALL_WINDOW_DRAGGABLE) {
+					this.clearSmallWindowMoveTimer()
+					this.clearSmallWindowNativeTranslation()
+					this.smallWindowTouch = null
+					this.suppressSmallWindowClick = false
+					return
+				}
+				this.clearSmallWindowMoveTimer()
+				const drag = this.smallWindowTouch
+				if (drag) {
+					// 松手时补上最后一帧位移，避免丢掉最后一次 touchmove。
+					this.commitSmallWindowPosition(drag.nextX, drag.nextY)
+					if (this.smallWindowNativeDrag && this.smallWindowNativeDragView) {
+						// 布局位置已提交；清零 translation。两者同一 tick，尽量让下一帧直接落在最终位置。
+						this.clearSmallWindowNativeTranslation()
+					}
+					this.suppressSmallWindowClick = Boolean(drag.moved)
+				}
+				this.smallWindowTouch = null
+			},
+			switchWindows() {
+				if (this.suppressSmallWindowClick) {
+					this.suppressSmallWindowClick = false
+					return
+				}
+				if (!this.remoteUid) return
+				this.clearSmallWindowNativeTranslation()
+				this.primaryView = this.primaryView === 'remote' ? 'local' : 'remote'
+				this.$emit('remote-user-click', {
+					uid: this.remoteUid
+				})
+				this.$emit('window-switch', {
+					primaryView: this.primaryView,
+					uid: this.remoteUid
+				})
+				this.bindVideoWindows()
+			},
+			/**
+			 * 关闭摄像头时不卸载原生视图、也不解绑 Canvas：占位层会覆盖冻结帧，
+			 * 恢复后仍在同一个 Surface 上渲染，避免视图重建导致小窗只剩边框。
+			 */
+			onLocalVideoChanged(muted) {
+				if (muted) return
+				// 重新开启采集与预览后强制重绑本地窗口，确保 Canvas 指向当前视图。
+				this.bindVideoWindows({
+					force: true,
+					slots: [this.localSlot()]
+				})
+			},
+			beforeCallDispose() {
+				this.unregisterAppShow()
+				this.unregisterAppHide()
+				this.stopCallingDotTimer()
+				this.stopDurationTimer()
+				this.durationStartedAt = 0
+				this.stopChromeAutoHide()
+				this.disableKeepScreenOn()
+				this.clearSmallWindowMoveTimer()
+				this.clearSmallWindowNativeTranslation()
+				this.destroyRingtone()
+				this.unbindVideoWindows()
+			},
+			toggleAudio() {
+				this.setAudioMuted(!this.audioMuted).catch((error) => this.reportError(error))
+			},
+			toggleVideo() {
+				this.setVideoMuted(!this.videoMuted).catch((error) => this.reportError(error))
+			},
+			flipCamera() {
+				this.switchCamera().catch((error) => this.reportError(error))
+			},
+			toggleSpeaker() {
+				this.setSpeakerphoneEnabled(!this.speakerphoneEnabled).catch((error) => this.reportError(error))
+			},
+			startJoin() {
+				this.join().catch(() => {})
+			},
+			endCall() {
+				this.hangUp().catch((error) => this.reportError(error))
+			}
+		}
+	}
+</script>
+
+<style>
+	.call {
+		flex: 1;
+		position: relative;
+		overflow: hidden;
+	}
+
+	.stage {
+		position: absolute;
+		left: 0;
+		top: 0;
+	}
+
+	/* 占位层覆盖在常驻的原生视频视图之上，层级低于控件。 */
+	.placeholder {
+		position: absolute;
+		left: 0;
+		top: 0;
+		align-items: center;
+		justify-content: center;
+		z-index: 1;
+	}
+
+	.avatar-circle {
+		width: 92px;
+		height: 92px;
+		border-radius: 46px;
+		background-color: rgba(255, 255, 255, 0.12);
+		align-items: center;
+		justify-content: center;
+	}
+
+	.placeholder-text {
+		margin-top: 14px;
+		font-size: 14px;
+	}
+
+	.small-window {
+		position: absolute;
+		left: 0;
+		top: 0;
+		border-radius: 10px;
+		/* 不加边框：nvue 的边框会让原生圆角裁剪容器尺寸不匹配，并在拖动时反复重绘。 */
+		overflow: hidden;
+		z-index: 3;
+	}
+
+	.small-window-gesture {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 100px;
+		height: 140px;
+		background-color: transparent;
+		z-index: 2;
+	}
+
+	.small-placeholder {
+		position: absolute;
+		left: 0;
+		top: 0;
+		z-index: 1;
+	}
+
+	.audio-stage {
+		flex: 1;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.audio-avatar {
+		width: 108px;
+		height: 108px;
+		border-radius: 54px;
+		align-items: center;
+		justify-content: center;
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.16);
+	}
+
+	.audio-name {
+		margin-top: 26px;
+		font-size: 22px;
+		font-weight: 500;
+	}
+
+	.audio-meta {
+		margin-top: 8px;
+		font-size: 14px;
+	}
+
+	.audio-hint {
+		margin-top: 6px;
+		font-size: 12px;
+	}
+
+	/* 呼叫页：覆盖在本地预览/暗色背景之上，层级低于顶部栏和控制栏。 */
+	.calling-overlay {
+		position: absolute;
+		left: 0;
+		top: 0;
+		right: 0;
+		bottom: 0;
+		z-index: 4;
+		overflow: hidden;
+	}
+
+	.calling-background {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 100%;
+		height: 100%;
+	}
+
+	.calling-scrim {
+		position: absolute;
+		left: 0;
+		top: 0;
+		right: 0;
+		bottom: 0;
+	}
+
+	.calling-content {
+		flex: 1;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.calling-avatar {
+		width: 88px;
+		height: 88px;
+		border-radius: 18px;
+		align-items: center;
+		justify-content: center;
+		overflow: hidden;
+	}
+
+	.calling-avatar-image {
+		width: 88px;
+		height: 88px;
+	}
+
+	.calling-name {
+		margin-top: 18px;
+		font-size: 22px;
+		font-weight: 500;
+		text-align: center;
+		width: 280px;
+	}
+
+	.calling-text {
+		margin-top: 8px;
+		font-size: 14px;
+		text-align: center;
+	}
+
+	.calling-dots {
+		margin-top: 16px;
+		flex-direction: row;
+		align-items: center;
+		height: 12px;
+	}
+
+	.calling-dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 4px;
+		margin-left: 5px;
+		margin-right: 5px;
+	}
+
+	.top-bar {
+		position: absolute;
+		left: 0;
+		right: 0;
+		top: 0;
+		padding-left: 16px;
+		padding-right: 16px;
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		z-index: 6;
+	}
+
+	.top-title {
+		position: absolute;
+		left: 80px;
+		right: 80px;
+		text-align: center;
+		font-size: 15px;
+	}
+
+	.top-duration {
+		position: absolute;
+		left: 80px;
+		right: 80px;
+		text-align: center;
+		font-size: 14px;
+		font-weight: 500;
+	}
+
+	.stage-tap {
+		position: absolute;
+		left: 0;
+		top: 0;
+		right: 0;
+		bottom: 0;
+		background-color: transparent;
+		z-index: 2;
+	}
+
+	.status-panel {
+		position: absolute;
+		left: 20px;
+		right: 20px;
+		align-items: center;
+		z-index: 6;
+	}
+
+	.status-text {
+		font-size: 14px;
+		text-align: center;
+		padding: 6px 12px;
+		border-radius: 12px;
+		background-color: rgba(0, 0, 0, 0.42);
+	}
+
+	.controls {
+		position: absolute;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		padding-left: 16px;
+		padding-right: 16px;
+		z-index: 5;
+	}
+
+	.control-row {
+		flex-direction: row;
+		align-items: flex-start;
+		justify-content: flex-start;
+		margin-top: 10px;
+	}
+
+	.control-item {
+		align-items: center;
+	}
+
+	.control-button {
+		width: 64px;
+		height: 64px;
+		border-radius: 32px;
+		align-items: center;
+		justify-content: center;
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.22);
+	}
+
+	.control-label {
+		margin-top: 8px;
+		font-size: 12px;
+		text-align: center;
+	}
+
+	.control-state {
+		margin-top: 2px;
+		font-size: 11px;
+		text-align: center;
+	}
+
+	.action-row {
+		margin-top: 20px;
+		flex-direction: row;
+		align-items: center;
+		justify-content: flex-start;
+	}
+
+	.hangup-button {
+		width: 76px;
+		height: 76px;
+		border-radius: 38px;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.hangup-label {
+		margin-top: 8px;
+		font-size: 12px;
+	}
+
+	.join-button {
+		margin-top: 12px;
+		width: 180px;
+		height: 46px;
+		border-radius: 23px;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.join-button-text {
+		font-size: 16px;
+	}
+</style>
